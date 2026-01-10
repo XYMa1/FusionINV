@@ -9,13 +9,14 @@ from typing import Tuple
 from skimage import exposure
 
 
-def retinex_decompose(image: np.ndarray, sigma: int = 15) -> Tuple[np.ndarray, np.ndarray]:
+def retinex_decompose(image: np.ndarray, sigma_list: list = [15, 80, 250]) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Retinex 分解：将图像分解为反射分量和光照分量
+    多尺度 Retinex 分解（改进版）
 
-    Args:
+    Args: 
         image: 输入图像 [H, W, 3], uint8, RGB
-        sigma: 高斯模糊的标准差，控制光照分量的平滑度
+        sigma_list: 多个尺度的高斯核标准差
+                    [15, 80, 250] 对应 小/中/大 三个尺度
 
     Returns:
         R: 反射分量（物体固有颜色）[H, W, 3], float32, [0, 1]
@@ -23,17 +24,26 @@ def retinex_decompose(image: np.ndarray, sigma: int = 15) -> Tuple[np.ndarray, n
     """
     # 转换到 float32 并归一化
     img_float = image.astype(np.float32) / 255.0
-
-    # 避免 log(0)
     img_float = np.maximum(img_float, 1e-6)
 
-    # 估计光照分量（用高斯模糊近似）
-    L = cv2.GaussianBlur(img_float, (0, 0), sigma)
-    L = np.maximum(L, 1e-6)
+    # 在对数域中累积
+    log_img = np.log(img_float)
+    log_L = np.zeros_like(log_img)
 
-    # 计算反射分量 R = I / L
-    R = img_float / L
-    R = np.clip(R, 0, 1)
+    # 多尺度均值
+    for sigma in sigma_list:
+        # 对每个尺度计算高斯模糊并累加
+        blurred = cv2.GaussianBlur(img_float, (0, 0), sigma)
+        blurred = np.maximum(blurred, 1e-6)
+        log_L += np.log(blurred)
+
+    # 取平均
+    log_L /= len(sigma_list)
+
+    # 分离反射和光照
+    log_R = log_img - log_L
+    R = np.clip(np.exp(log_R), 0, 1)
+    L = np.clip(np.exp(log_L), 0, 1)
 
     return R, L
 
@@ -42,11 +52,11 @@ def enhance_illumination(L: np.ndarray, gamma: float = 0.4) -> np.ndarray:
     """
     增强光照分量
 
-    Args: 
+    Args:
         L: 光照分量 [H, W, 3], float32, [0, 1]
         gamma:  Gamma 校正系数，越小提亮越强（0.4 用于极暗场景）
 
-    Returns: 
+    Returns:
         L_enhanced: 增强后的光照 [H, W, 3], float32, [0, 1]
     """
     L_enhanced = np.power(L, gamma)
@@ -84,17 +94,17 @@ def apply_clahe(image: np.ndarray, clip_limit: float = 0.03) -> np.ndarray:
 
 def enhance_low_light(image: np.ndarray,
                       exposure: float = None,
-                      sigma: int = 15) -> np.ndarray:
+                      sigma_list: list = [15, 80, 250]) -> np.ndarray:  # 修改参数
     """
     完整的低光增强流程（主函数）
 
     Args: 
         image: 输入图像 [H, W, 3], uint8, RGB
         exposure: 曝光度（0-1），如果为 None 则自动计算
-        sigma:  Retinex 分解的高斯核大小
+        sigma_list: 多尺度 Retinex 的尺度列表
 
-    Returns: 
-        enhanced: 增强后的图像 [H, W, 3], uint8, RGB
+    Returns:
+        enhanced:  增强后的图像 [H, W, 3], uint8, RGB
     """
     # 1. 计算曝光度（如果未提供）
     if exposure is None:
@@ -109,22 +119,16 @@ def enhance_low_light(image: np.ndarray,
     else:
         gamma = 0.6  # 正常偏暗
 
-    print(f"  [增强] 曝光度={exposure:.3f}, Gamma={gamma}")
+    print(f"  [增强] 曝光度={exposure:.3f}, Gamma={gamma}, 多尺度Retinex")
 
-    # 3. Retinex 分解
-    R, L = retinex_decompose(image, sigma=sigma)
+    # 3. 多尺度 Retinex 分解（改进）
+    R, L = retinex_decompose(image, sigma_list=sigma_list)
 
-    # 4. 增强光照分量
+    # 4-7. 后续步骤保持不变
     L_enhanced = enhance_illumination(L, gamma=gamma)
-
-    # 5. 重组图像
     I_enhanced = R * L_enhanced
     I_enhanced = np.clip(I_enhanced, 0, 1)
-
-    # 6.  CLAHE 自适应均衡
     I_final = apply_clahe(I_enhanced, clip_limit=0.03)
-
-    # 7. 转回 uint8
     result = (I_final * 255).astype(np.uint8)
 
     return result
