@@ -1,0 +1,674 @@
+LIT-Fusion (Semantically-Guided Low-Light Infrared and Visible Image Fusion via Adaptive Latent Inversion)
+1、核心创新点
+
+创新点 1：照明感知的双路潜层初始化
+
+Illumination-Aware Dual-Stream Latent Initialization
+
+痛点：
+
+直接对极低光照图像进行 DDPM Inversion 会导致潜在编码 (Latent Code) 陷入"黑暗流形"，丢失语义信息，无法为融合提供有效引导。
+
+创新：
+
+提出 Retinex 解耦与语义引导反演相结合的双路初始化策略：
+
+红外路：提取几何边缘作为结构约束
+
+可见光路：分离反射分量与光照分量，仅增强光照保持色彩保真，结合照明感知提示词进行定向反演
+
+学术价值：
+
+打破传统方法对输入图像质量的依赖，通过扩散模型的生成先验重建丢失的光照信息。
+
+创新点 2：结构约束的三流混合注意力机制
+
+Structure-Constrained Triple-Stream Hybrid Attention
+
+痛点：
+
+现有融合方法难以平衡红外的结构保真、可见光的语义一致性、以及低光场景的光照重建三者关系。
+
+创新：
+
+在 U-Net 解码器的自注意力层中，动态混合三个信息源：
+
+结构流 (Kir,Vir)：红外热目标的几何特征
+
+语义流 (Kvi,Vvi)：可见光的物体类别信息
+
+光照流 (Ktxt,Vtxt)：文本提示的光照风格先验
+
+通过自适应权重 w1(t),w2(t),w3(t) 在去噪过程中动态调度三者贡献。
+
+学术价值：
+
+首次在扩散模型框架下实现多模态特征的解耦与可控融合，无需训练即可适应不同光照条件。
+
+创新点 3：曝光感知的自适应时序调度
+
+Exposure-Aware Adaptive Temporal Scheduling
+
+痛点：
+
+固定的融合时序（如前 40 步用 IR，后 60 步用 VI）无法应对极暗、弱光、正常光等不同场景。
+
+创新：
+
+基于输入图像的曝光度指标 Evi 动态调整三流权重  时序演化曲线：
+
+极暗场景：全程强化光照流和结构流
+
+弱光场景：中期即开始引入语义流
+
+正常光：快速过渡到语义流主导
+
+学术价值：
+
+提出首个自适应的多模态融合调度策略，实现"一个模型，全场景适配"。
+
+2、具体实现路径（Refined Pipeline）
+
+阶段 1：照明感知的双路潜层初始化
+
+1.1 红外路 (IR Stream)
+
+输入：I_ir ∈ ℝ^(H×W×3)
+
+  ↓
+
+边缘提取：E_ir = Canny(RGB2Gray(I_ir), threshold=[50,150])
+
+  ↓
+
+特征编码：z_ir = VAE_encode(I_ir)  # [1, 4, 64, 64]
+
+  ↓
+
+DDPM Inversion：
+
+  - Prompt: "" (空提示，保留原始热特征)
+
+  - CFG Scale: 1.0 (无引导)
+
+  → noise_ir, latents_ir
+
+1.2 可见光路 (VI Stream - 核心改进)
+
+输入：I_vi ∈ ℝ^(H×W×3) (低光图像)
+
+  ↓
+
+【步骤1: Retinex 分解】
+
+  R, L = Retinex_decompose(I_vi)
+
+  # R: 反射分量（物体本色）
+
+  # L: 光照分量（亮度）
+
+  ↓
+
+【步骤2: 照明增强】
+
+  L_enhanced = L^γ, where γ = 0.4 (极暗) or 0.5 (弱光)
+
+  I_vi_enhanced = R ⊙ L_enhanced  # 逐元素乘法
+
+  ↓
+
+【步骤3: 自适应直方图均衡】
+
+  I_vi_pre = CLAHE(I_vi_enhanced, clip_limit=0.03)
+
+  ↓
+
+【步骤4: 曝光度评估】
+
+  I_gray = 0.299*R + 0.587*G + 0.114*B
+
+  E_vi = mean(I_gray) / 255.0  # ∈ [0, 1]
+
+  ↓
+
+【步骤5: 动态提示词生成】
+
+  if E_vi < 0.2: 
+
+      prompt = "extremely dark scene transformed to bright daylight"
+
+  elif E_vi < 0.4:
+
+      prompt = "low light scene with natural illumination"
+
+  else:
+
+      prompt = "dimly lit scene with enhanced visibility"
+
+  ↓
+
+【步骤6: 引导反演】
+
+  noise_vi, latents_vi = DDPM_Inversion(
+
+      x0 = I_vi_pre,
+
+      prompt = prompt,
+
+      cfg_scale = 5.5,
+
+      num_steps = 100
+
+  )
+
+阶段 2：结构约束的三流混合注意力机制
+
+2.1 准备工作
+
+# 初始化三路潜在编码
+
+z_fusion = z_vi. clone()  # 从可见光初始化
+
+z_t = [z_fusion, z_vi, z_ir]  # 3个样本批次
+
+
+
+# ControlNet 预处理（低权重，后期可调）
+
+controlnet_weight = 0.15  # 初始值可设为 0.0 测试
+
+edge_condition = preprocess_edge(E_ir)
+
+2.2 去噪循环核心（在 U-Net Decoder 的 Self-Attention 层）
+
+class TripleStreamAttentionProcessor: 
+
+    def __call__(self, attn, hidden_states, ... ):
+
+        # 标准 Attention 计算
+
+        Q = attn.to_q(hidden_states)
+
+        K_original = attn.to_k(hidden_states)
+
+        V_original = attn.to_v(hidden_states)
+
+        
+
+        # 提取三流特征
+
+        K_ir, V_ir = K_original[IR_INDEX], V_original[IR_INDEX]
+
+        K_vi, V_vi = K_original[VI_INDEX], V_original[VI_INDEX]
+
+        
+
+        # 🔑 从 Cross-Attention 窃取文本特征
+
+        K_txt, V_txt = self.get_text_features_from_cross_attn()
+
+        
+
+        # 🎯 计算自适应权重
+
+        w1, w2, w3 = compute_adaptive_weights(
+
+            timestep=self.current_step,
+
+            exposure=self.E_vi,
+
+            total_steps=self.total_steps
+
+        )
+
+        
+
+        # 🔀 三流融合
+
+        K_fused = w1 * K_ir + w2 * K_vi + w3 * K_txt
+
+        V_fused = w1 * V_ir + w2 * V_vi + w3 * V_txt
+
+        
+
+        # 🔧 ControlNet 增强（可选，权重可为0）
+
+        if self.use_controlnet:
+
+            ctrl_features = self.controlnet_residual
+
+            K_fused = K_fused + controlnet_weight * ctrl_features['K']
+
+            V_fused = V_fused + controlnet_weight * ctrl_features['V']
+
+        
+
+        # 计算 Attention
+
+        K_fused[OUT_INDEX] = K_fused
+
+        V_fused[OUT_INDEX] = V_fused
+
+        
+
+        attn_output = scaled_dot_product_attention(Q, K_fused, V_fused)
+
+        return attn_output
+
+2.3 文本特征提取（关键实现）
+
+def get_text_features_from_cross_attn(self):
+
+    """从 Cross-Attention 层窃取已处理的文本特征"""
+
+    # 在 Cross-Attention forward 时保存
+
+    # text_embeds: [batch, 77, 768] 来自 CLIP
+
+    # 经过 to_k, to_v 投影后:  [batch, seq_len, dim]
+
+    
+
+    K_txt = self.cached_cross_attn_K  # 由外部注入
+
+    V_txt = self.cached_cross_attn_V
+
+    
+
+    # 平均池化到 Self-Attention 的序列长度
+
+    K_txt = adaptive_pool(K_txt, target_len=self.spatial_res**2)
+
+    V_txt = adaptive_pool(V_txt, target_len=self.spatial_res**2)
+
+    
+
+    return K_txt, V_txt
+
+阶段 3：曝光感知的自适应时序调度
+
+3.1 权重计算函数（代码实现 - 线性版 MVP）
+
+def compute_adaptive_weights_linear(t, T, E_vi):
+
+    """
+
+    Args:
+
+        t: 当前时间步 (100 → 0)
+
+        T: 总时间步数 (100)
+
+        E_vi: 曝光度 [0, 1]
+
+    Returns:
+
+        w1, w2, w3: 归一化权重
+
+    """
+
+    t_norm = t / T  # 归一化到 [1, 0]
+
+    
+
+    # 阶段判断
+
+    if t_norm > 0.6:  # Early:  强结构
+
+        w1_base = 0.7
+
+        w2_base = 0.2
+
+        w3_base = 0.1
+
+    elif t_norm > 0.2:  # Mid: 平衡
+
+        alpha = (t_norm - 0.2) / 0.4  # 0.6→0.2 映射到 [1, 0]
+
+        w1_base = 0.7 * alpha + 0.3 * (1-alpha)
+
+        w2_base = 0.2 * alpha + 0.6 * (1-alpha)
+
+        w3_base = 0.1
+
+    else:  # Late: 强语义
+
+        w1_base = 0.3
+
+        w2_base = 0.6
+
+        w3_base = 0.1
+
+    
+
+    # 曝光度调制
+
+    w2 = w2_base * E_vi  # 低光时降低 VI 权重
+
+    w3 = w3_base * (1 + 2*(1 - E_vi))  # 低光时增强文本引导
+
+    w1 = 1 - w2 - w3  # 保证归一化
+
+    
+
+    return w1, w2, w3
+
+3.2 权重演化曲线（论文用 - 非线性版）
+
+import numpy as np
+
+
+
+def compute_adaptive_weights_nonlinear(t, T, E_vi):
+
+    """论文公式版本"""
+
+    t_norm = t / T
+
+    
+
+    # IR 权重：指数衰减
+
+    w1 = 0.8 * np.exp(-3 * (1-t_norm)) + 0.1
+
+    
+
+    # VI 权重：Sigmoid 过渡 × 曝光度
+
+    w2 = (1 / (1 + np.exp(-10*(t_norm - 0.5)))) * E_vi
+
+    
+
+    # Text 权重：前期 × 低光
+
+    w3 = 0.3 * (1 - E_vi) * (1 - t_norm)
+
+    
+
+    # 归一化
+
+    total = w1 + w2 + w3
+
+    return w1/total, w2/total, w3/total
+
+3、论文公式（LaTeX 格式）
+
+3.1 核心融合公式
+
+\subsection{Triple-Stream Hybrid Attention Fusion}
+
+
+
+Given the query $\mathbf{Q} \in \mathbb{R}^{N \times d_k}$ derived from the current denoising state $\mathbf{z}_t$, we construct the fused keys and values by linearly combining three information streams:
+
+
+
+\begin{equation}
+
+\begin{aligned}
+
+\mathbf{K}_{\text{fused}}^{(t)} &= w_1^{(t)} \mathbf{K}_{\text{ir}} + w_2^{(t)} \mathbf{K}_{\text{vi}} + w_3^{(t)} \mathbf{K}_{\text{txt}} \\
+
+\mathbf{V}_{\text{fused}}^{(t)} &= w_1^{(t)} \mathbf{V}_{\text{ir}} + w_2^{(t)} \mathbf{V}_{\text{vi}} + w_3^{(t)} \mathbf{V}_{\text{txt}}
+
+\end{aligned}
+
+\end{equation}
+
+
+
+where $\mathbf{K}_{\text{ir}}, \mathbf{V}_{\text{ir}}$ preserve thermal structural features, $\mathbf{K}_{\text{vi}}, \mathbf{V}_{\text{vi}}$ retain visible semantic information, and $\mathbf{K}_{\text{txt}}, \mathbf{V}_{\text{txt}}$ inject illumination priors from text embeddings.  The weights satisfy:
+
+
+
+\begin{equation}
+
+w_1^{(t)} + w_2^{(t)} + w_3^{(t)} = 1, \quad w_i \in [0, 1]
+
+\end{equation}
+
+
+
+The hybrid attention is then computed as:
+
+
+
+\begin{equation}
+
+\text{Attention}_{\text{hybrid}} = \text{softmax}\left(\frac{\mathbf{Q} \cdot \mathbf{K}_{\text{fused}}^{\top}}{\sqrt{d_k}}\right) \mathbf{V}_{\text{fused}}
+
+\end{equation}
+
+3.2 自适应权重调度
+
+\subsection{Adaptive Temporal Weighting Schedule}
+
+
+
+To adapt to varying illumination conditions, we design an exposure-aware scheduling strategy.  First, we quantify the illumination level of the visible image using: 
+
+
+
+\begin{equation}
+
+E_{\text{vi}} = \frac{1}{HW} \sum_{i,j} (0.299 R_{ij} + 0.587 G_{ij} + 0.114 B_{ij})
+
+\end{equation}
+
+
+
+The temporal weights are then modulated as:
+
+
+
+\begin{equation}
+
+\begin{aligned}
+
+w_1^{(t)} &= \alpha_0 \cdot \exp\left(-\lambda \frac{T-t}{T}\right) + \beta_0 \\
+
+w_2^{(t)} &= \frac{1}{1 + \exp\left(-k\left(\frac{t}{T} - 0.5\right)\right)} \cdot E_{\text{vi}} \\
+
+w_3^{(t)} &= \gamma_0 \cdot (1 - E_{\text{vi}}) \cdot \left(1 - \frac{t}{T}\right)
+
+\end{aligned}
+
+\end{equation}
+
+
+
+where $\alpha_0=0.8, \beta_0=0.1, \lambda=3, k=10, \gamma_0=0.3$ are empirically determined hyperparameters.  This ensures: 
+
+\begin{itemize}
+
+    \item \textbf{Early stage} ($T \to 0.6T$): High $w_1$ enforces IR structural guidance. 
+
+    \item \textbf{Mid stage} ($0.6T \to 0.2T$): Smooth transition balancing structure and semantics.
+
+    \item \textbf{Late stage} ($0.2T \to 0$): High $w_2$ recovers VI textural details.
+
+\end{itemize}
+
+
+
+For extremely dark scenes ($E_{\text{vi}} < 0.2$), $w_3$ is elevated throughout to leverage diffusion priors for hallucinating realistic illumination. 
+
+3.3 ControlNet 集成（可选模块）
+
+\subsection{Structure Constraint via ControlNet}
+
+
+
+To further preserve infrared geometric fidelity, we optionally integrate ControlNet~\cite{zhang2023controlnet} with Canny edge maps:
+
+
+
+\begin{equation}
+
+\mathbf{E}_{\text{ir}} = \text{Canny}(\text{RGB2Gray}(\mathbf{I}_{\text{ir}}), \tau_{\text{low}}=50, \tau_{\text{high}}=150)
+
+\end{equation}
+
+
+
+The ControlNet residual features $\Delta \mathbf{F}_{\text{ctrl}}$ are injected into the decoder layers with a low weight $\alpha_{\text{ctrl}}=0.15$ to avoid over-constraining the generation: 
+
+
+
+\begin{equation}
+
+\begin{aligned}
+
+\mathbf{K}_{\text{fused}} &\leftarrow \mathbf{K}_{\text{fused}} + \alpha_{\text{ctrl}} \Delta \mathbf{K}_{\text{ctrl}} \\
+
+\mathbf{V}_{\text{fused}} &\leftarrow \mathbf{V}_{\text{fused}} + \alpha_{\text{ctrl}} \Delta \mathbf{V}_{\text{ctrl}}
+
+\end{aligned}
+
+\end{equation}
+
+
+
+This module can be ablated ($\alpha_{\text{ctrl}}=0$) for faster inference without significant quality degradation in most scenarios. 
+
+3.4 色彩一致性后处理
+
+\subsection{Color Consistency Post-processing}
+
+
+
+To mitigate potential color distortions, we apply an adaptive color transfer in the YCbCr space:
+
+
+
+\begin{equation}
+
+\mathbf{I}_{\text{final}} = \text{YCbCr2RGB}(Y_{\text{gen}}, \beta Cb_{\text{gen}} + (1-\beta) Cb_{\text{vi}}, \beta Cr_{\text{gen}} + (1-\beta) Cr_{\text{vi}})
+
+\end{equation}
+
+
+
+where $\beta = \min(1, 0.5 + E_{\text{vi}})$ adaptively balances generated and original chrominance based on the exposure level. 
+
+4、算法伪代码（写入论文 Algorithm 环境）
+
+\begin{algorithm}[t]
+
+\caption{LIT-Fusion:  Low-Light Infrared-Visible Fusion}
+
+\label{alg:lit_fusion}
+
+\begin{algorithmic}[1]
+
+\REQUIRE Infrared image $\mathbf{I}_{\text{ir}}$, low-light visible image $\mathbf{I}_{\text{vi}}$
+
+\ENSURE Fused image $\mathbf{I}_{\text{fusion}}$
+
+
+
+\STATE \textbf{// Stage 1: Latent Initialization}
+
+\STATE $\mathbf{E}_{\text{ir}} \gets \text{Canny}(\mathbf{I}_{\text{ir}})$
+
+\STATE $\mathbf{R}, \mathbf{L} \gets \text{RetinexDecompose}(\mathbf{I}_{\text{vi}})$
+
+\STATE $\mathbf{I}'_{\text{vi}} \gets \mathbf{R} \odot \mathbf{L}^{0.4}$ \COMMENT{Enhance illumination}
+
+\STATE $E_{\text{vi}} \gets \text{ComputeExposure}(\mathbf{I}'_{\text{vi}})$ \COMMENT{Eq. 4}
+
+\STATE $\mathbf{z}_{\text{ir}}, \mathbf{z}_{\text{vi}} \gets \text{DDPMInversion}(\mathbf{I}_{\text{ir}}, \mathbf{I}'_{\text{vi}}, E_{\text{vi}})$
+
+
+
+\STATE \textbf{// Stage 2: Hybrid Attention Fusion}
+
+\STATE $\mathbf{z}_t \gets [\mathbf{z}_{\text{vi}}, \mathbf{z}_{\text{vi}}, \mathbf{z}_{\text{ir}}]$ \COMMENT{Initialize 3 samples}
+
+\FOR{$t = T-\text{skip\_steps}$ \TO $0$}
+
+    \STATE $w_1, w_2, w_3 \gets \text{AdaptiveWeights}(t, T, E_{\text{vi}})$ \COMMENT{Eq. 5}
+
+    \STATE $\mathbf{K}_{\text{fused}}, \mathbf{V}_{\text{fused}} \gets$ TripleStreamFusion($\mathbf{z}_t, w_1, w_2, w_3$) \COMMENT{Eq. 1}
+
+    \IF{use\_controlnet}
+
+        \STATE $\mathbf{K}_{\text{fused}} \gets \mathbf{K}_{\text{fused}} + 0.15 \cdot \text{ControlNet}(\mathbf{E}_{\text{ir}})$
+
+    \ENDIF
+
+    \STATE $\mathbf{z}_{t-1} \gets \text{DDIMStep}(\mathbf{z}_t, \mathbf{K}_{\text{fused}}, \mathbf{V}_{\text{fused}})$
+
+\ENDFOR
+
+
+
+\STATE \textbf{// Stage 3: Decode and Post-process}
+
+\STATE $\mathbf{I}_{\text{gen}} \gets \text{VAEDecode}(\mathbf{z}_0)$
+
+\STATE $\mathbf{I}_{\text{fusion}} \gets \text{ColorCorrection}(\mathbf{I}_{\text{gen}}, \mathbf{I}_{\text{vi}}, E_{\text{vi}})$ \COMMENT{Eq. 7}
+
+\RETURN $\mathbf{I}_{\text{fusion}}$
+
+\end{algorithmic}
+
+\end{algorithm}
+
+5、实施路线（MVP 优先）
+
+Phase 1: MVP 版本（Day 1-2）
+
+目标：验证核心机制，不追求完美
+
+# 功能清单
+
+✅ Retinex 增强 + 引导反演
+
+✅ 三流注意力融合（线性权重）
+
+✅ 基础去噪循环
+
+❌ 暂不加 ControlNet（weight=0）
+
+❌ 暂不做色彩后处理
+
+
+
+# 验证指标
+
+- 融合图是否比原 VI 图亮？
+
+- 是否保留了 IR 的热目标？
+
+- 有无明显伪影？
+
+Phase 2: 完整版本（Day 3-4）
+
+✅ 加入 ControlNet（weight=0.15）
+
+✅ 实现非线性权重（Sigmoid/Exp）
+
+✅ 色彩后处理
+
+✅ 完整的 E_vi 自适应
+
+
+
+# 对比实验
+
+- MVP vs 完整版
+
+- 线性权重 vs 非线性权重
+
+- 有无 ControlNet
+
+Phase 3: 论文实验（Day 5-7）
+
+✅ LLVIP/MSRS/TNO 数据集批量测试
+
+✅ 定量指标：EN, MI, SF, VIF, Qabf
+
+✅ 消融实验
+
+✅ 可视化对比

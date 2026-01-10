@@ -1,0 +1,49 @@
+LIT-Fusion (Semantically-Guided Low-Light Infrared and Visible Image Fusion via Adaptive Latent Inversion)
+第一部分：核心创新点 (Core Innovations)创新点 1：照明感知的双路潜层初始化 (Illumination-Aware Dual-Stream Latent Initialization)痛点： 直接对极低光照图像进行 DDPM Inversion 会导致潜在编码陷入“黑暗流形”，丢失语义信息。方案： 提出 Retinex 解耦与语义引导反演相结合的策略。红外路提取几何边缘；可见光路分离光照分量 ($L$) 并增强，结合照明感知提示词 (Prompt) 进行定向反演。价值： 打破了生成式融合对输入光照质量的依赖。创新点 2：结构约束的三流混合注意力机制 (Structure-Constrained Triple-Stream Hybrid Attention)痛点： 难以平衡结构保真度、语义一致性和光照重建。方案： 在 U-Net 解码器中动态混合三个特征流：结构流 ($K_{ir}, V_{ir}$): 红外热目标几何特征。语义流 ($K_{vi}, V_{vi}$): 可见光物体类别信息。光照流 ($K_{txt}, V_{txt}$): 文本提示的光照风格先验。价值： 首次在扩散模型中实现无需训练的多模态解耦融合。创新点 3：曝光感知的自适应时序调度 (Exposure-Aware Adaptive Temporal Scheduling)痛点： 固定步数的融合策略无法适配不同光照等级（极暗 vs 弱光）。方案： 基于输入图像的曝光度指标 $E_{vi}$，构建自适应权重函数 $f(E_{vi}, t)$。极暗场景强化生成先验，弱光场景保留更多原始纹理。价值： 实现了“一个模型，全场景适配”。第二部分：具体实现路径 (Implementation Pipeline)阶段 1：照明感知的双路潜层初始化红外路 (IR): 输入 $\rightarrow$ Canny 边缘 $\rightarrow$ VAE Encode $\rightarrow$ 空 Prompt 反演 $\rightarrow$ 得到 noise_ir, latents_ir。可见光路 (VI - 核心):Retinex 分解: $I_{vi} \rightarrow R, L$。光照增强: $L' = L^\gamma$ (极暗 $\gamma=0.4$, 弱光 $\gamma=0.5$)。重组: $I'_{vi} = R \times L'$ (保持色彩，提升亮度)。曝光评估: 计算 $E_{vi}$ (加权灰度均值)。Prompt 生成: 基于 $E_{vi}$ 选择 "Daylight" 或 "Natural illumination"。引导反演: 使用增强后的 $I'_{vi}$ 和 Prompt 进行 DDPM Inversion，CFG=5.5，得到语义清晰的 latents_vi。阶段 2：结构约束的三流混合注意力机制位置: U-Net Decoder 的 Self-Attention 层。操作: 拦截原始 $K, V$，将其替换为三流加权和。技巧: $K_{txt}, V_{txt}$ 需从 Cross-Attention 层获取并进行 Adaptive Pooling 以匹配空间维度。ControlNet: 将边缘特征作为残差加入 ($weight=0.15$)。阶段 3：自适应调度与后处理权重逻辑:Early (0-40%): 强结构 (IR) + 强光照 (Text)。Mid (40-80%): 过渡期。Late (80-100%): 强纹理 (VI)。后处理: YCbCr 空间色彩混合，防止生成色偏。第三部分：论文公式 (Mathematical Formulation)(提示：在 Word 中按 Alt + = 呼出公式编辑器，将下方 LaTeX 代码粘贴进去并回车即可转换)3.1 核心融合公式 (Triple-Stream Hybrid Attention)描述： 定义了融合后的 Key 和 Value 是三个流的线性组合。LaTeX 代码：代码段\begin{aligned}
+\mathbf{K}_{\text{fused}}^{(t)} &= w_1^{(t)} \mathbf{K}_{\text{ir}} + w_2^{(t)} \mathbf{K}_{\text{vi}} + w_3^{(t)} \mathbf{K}_{\text{txt}} \\
+\mathbf{V}_{\text{fused}}^{(t)} &= w_1^{(t)} \mathbf{V}_{\text{ir}} + w_2^{(t)} \mathbf{V}_{\text{vi}} + w_3^{(t)} \mathbf{V}_{\text{txt}}
+\end{aligned}
+Attention 计算：代码段\text{Attention}_{\text{hybrid}} = \text{softmax}\left(\frac{\mathbf{Q} \cdot \mathbf{K}_{\text{fused}}^{\top}}{\sqrt{d_k}}\right) \mathbf{V}_{\text{fused}}
+3.2 曝光度计算 (Exposure Metric)描述： 计算可见光图像的感知亮度。LaTeX 代码：代码段E_{\text{vi}} = \frac{1}{HW} \sum_{i,j} (0.299 R_{ij} + 0.587 G_{ij} + 0.114 B_{ij})
+3.3 自适应权重调度 (Adaptive Scheduling)描述： 权重随时间 $t$ 和曝光度 $E_{vi}$ 变化的函数（非线性版本）。LaTeX 代码：代码段\begin{aligned}
+w_1^{(t)} &= \alpha_0 \cdot \exp\left(-\lambda \frac{T-t}{T}\right) + \beta_0 \\
+w_2^{(t)} &= \frac{1}{1 + \exp\left(-k\left(\frac{t}{T} - 0.5\right)\right)} \cdot E_{\text{vi}} \\
+w_3^{(t)} &= \gamma_0 \cdot (1 - E_{\text{vi}}) \cdot \left(1 - \frac{t}{T}\right)
+\end{aligned}
+(注：$\alpha_0, \beta_0$ 等为超参数，文中需说明)3.4 ControlNet 约束描述： 将边缘残差注入特征。LaTeX 代码：代码段\begin{aligned}
+\mathbf{K}_{\text{fused}} &\leftarrow \mathbf{K}_{\text{fused}} + \alpha_{\text{ctrl}} \Delta \mathbf{K}_{\text{ctrl}} \\
+\mathbf{V}_{\text{fused}} &\leftarrow \mathbf{V}_{\text{fused}} + \alpha_{\text{ctrl}} \Delta \mathbf{V}_{\text{ctrl}}
+\end{aligned}
+3.5 色彩一致性描述： 基于 YCbCr 的自适应混合。LaTeX 代码：代码段\mathbf{I}_{\text{final}} = \text{YCbCr2RGB}(Y_{\text{gen}}, \beta Cb_{\text{gen}} + (1-\beta) Cb_{\text{vi}}, \beta Cr_{\text{gen}} + (1-\beta) Cr_{\text{vi}})
+第四部分：算法伪代码 (Algorithm)代码段\begin{algorithm}[t]
+\caption{LIT-Fusion: Low-Light Infrared-Visible Fusion}
+\label{alg:lit_fusion}
+\begin{algorithmic}[1]
+\REQUIRE Infrared image $\mathbf{I}_{\text{ir}}$, low-light visible image $\mathbf{I}_{\text{vi}}$
+\ENSURE Fused image $\mathbf{I}_{\text{fusion}}$
+
+\STATE \textbf{// Stage 1: Latent Initialization}
+\STATE $\mathbf{E}_{\text{ir}} \gets \text{Canny}(\mathbf{I}_{\text{ir}})$
+\STATE $\mathbf{R}, \mathbf{L} \gets \text{RetinexDecompose}(\mathbf{I}_{\text{vi}})$
+\STATE $\mathbf{I}'_{\text{vi}} \gets \mathbf{R} \odot \mathbf{L}^{0.4}$ \COMMENT{Enhance illumination}
+\STATE $E_{\text{vi}} \gets \text{ComputeExposure}(\mathbf{I}'_{\text{vi}})$
+\STATE $\mathbf{z}_{\text{ir}}, \mathbf{z}_{\text{vi}} \gets \text{DDPMInversion}(\mathbf{I}_{\text{ir}}, \mathbf{I}'_{\text{vi}}, E_{\text{vi}})$
+
+\STATE \textbf{// Stage 2: Hybrid Attention Fusion}
+\STATE $\mathbf{z}_t \gets [\mathbf{z}_{\text{vi}}, \mathbf{z}_{\text{vi}}, \mathbf{z}_{\text{ir}}]$ \COMMENT{Init 3 streams}
+\FOR{$t = T-\text{skip\_steps}$ \TO $0$}
+    \STATE $w_1, w_2, w_3 \gets \text{AdaptiveWeights}(t, T, E_{\text{vi}})$
+    \STATE $\mathbf{K}_{\text{fused}}, \mathbf{V}_{\text{fused}} \gets$ TripleStreamFusion($\mathbf{z}_t, w_1, w_2, w_3$)
+    \IF{use\_controlnet}
+        \STATE $\mathbf{K}_{\text{fused}} \gets \mathbf{K}_{\text{fused}} + 0.15 \cdot \text{ControlNet}(\mathbf{E}_{\text{ir}})$
+    \ENDIF
+    \STATE $\mathbf{z}_{t-1} \gets \text{DDIMStep}(\mathbf{z}_t, \mathbf{K}_{\text{fused}}, \mathbf{V}_{\text{fused}})$
+\ENDFOR
+
+\STATE \textbf{// Stage 3: Decode & Post-process}
+\STATE $\mathbf{I}_{\text{gen}} \gets \text{VAEDecode}(\mathbf{z}_0)$
+\STATE $\mathbf{I}_{\text{fusion}} \gets \text{ColorCorrection}(\mathbf{I}_{\text{gen}}, \mathbf{I}_{\text{vi}}, E_{\text{vi}})$
+\RETURN $\mathbf{I}_{\text{fusion}}$
+\end{algorithmic}
+\end{algorithm}
+第五部分：MVP 实施行动指南 (Action Plan)Day 1-2: 核心验证 (MVP)实现 Retinex 预处理： 写好 Gamma 校正和 Inversion 脚本。实现三流 Attention (线性)： 不加 ControlNet，用最简单的线性插值权重。目标： 跑通一张图，确认生成的图像是“亮的”且有“红外轮廓”。Day 3-4: 完整功能加入 ControlNet： 提升边缘锐度。切换非线性公式： 替换权重计算函数，提升指标。加入 E_vi 自适应： 测试极暗图和弱光图的区别。Day 5+: 实验与论文批量跑 LLVIP 数据集。计算指标 (EN, SF, VIF, Qabf)。
