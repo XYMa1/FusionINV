@@ -1,159 +1,167 @@
 """
-曝光度评估模块
-计算图像的光照水平，用于自适应权重调度
+低光照图像增强模块
+实现基于 Retinex 理论的结构保留增强
 """
 
 import numpy as np
-from typing import Union
-from PIL import Image
+import cv2
+from typing import Tuple
+from skimage import exposure
 
 
-def compute_exposure(image: Union[np.ndarray, Image. Image]) -> float:
+def retinex_decompose(image: np.ndarray, sigma_list: list = [15, 80, 250]) -> Tuple[np.ndarray, np.ndarray]:
     """
-    计算图像的曝光度指标 E_vi
-    
-    Args:
-        image: 输入图像
-               - np.ndarray: [H, W, 3], uint8, RGB
-               - PIL.Image: RGB 模式
-    
-    Returns: 
-        E_vi: 曝光度，范围 [0, 1]
-              0. 0 = 全黑
-              0.2 = 极暗
-              0.4 = 弱光
-              0.6 = 正常
-              1.0 = 过曝
-    """
-    # 转换为 numpy 数组
-    if isinstance(image, Image.Image):
-        image = np.array(image)
-    
-    # 确保是 RGB 格式
-    if image.ndim == 2:  # 灰度图
-        I_gray = image
-    elif image.shape[2] == 3:  # RGB
-        # 使用人眼感知权重计算灰度
-        I_gray = 0.299 * image[:, :, 0] + \
-                 0.587 * image[:, :, 1] + \
-                 0.114 * image[:, :, 2]
-    else: 
-        raise ValueError(f"不支持的图像格式：{image.shape}")
-    
-    # 归一化到 [0, 1]
-    E_vi = np.mean(I_gray) / 255.0
-    
-    return float(E_vi)
+    多尺度 Retinex 分解（改进版）
 
-
-def get_illumination_level(E_vi: float) -> str:
-    """
-    根据曝光度返回光照等级描述
-    
-    Args: 
-        E_vi: 曝光度 [0, 1]
-    
-    Returns:
-        level: 光照等级字符串
-    """
-    if E_vi < 0.15:
-        return "极暗 (Extremely Dark)"
-    elif E_vi < 0.3:
-        return "很暗 (Very Dark)"
-    elif E_vi < 0.45:
-        return "弱光 (Low Light)"
-    elif E_vi < 0.6:
-        return "正常偏暗 (Dim)"
-    elif E_vi < 0.75:
-        return "正常 (Normal)"
-    else:
-        return "明亮 (Bright)"
-
-
-def generate_dynamic_prompt(E_vi: float) -> str:
-    """
-    根据曝光度生成动态的 Inversion 提示词
-    
-    Args:
-        E_vi:  曝光度 [0, 1]
-    
-    Returns:
-        prompt: 用于 DDPM Inversion 的提示词
-    """
-    if E_vi < 0.2:
-        # 极暗：强烈的光照重建
-        prompt = "extremely dark scene transformed to bright daylight, clear visibility, natural illumination"
-    elif E_vi < 0.4:
-        # 弱光：中等光照增强
-        prompt = "low light scene with natural illumination, enhanced visibility, daytime lighting"
-    elif E_vi < 0.6:
-        # 正常偏暗：轻微增强
-        prompt = "dimly lit scene with improved clarity, better lighting"
-    else:
-        # 正常：保持原样
-        prompt = ""
-    
-    return prompt
-
-
-def compute_exposure_statistics(image: np.ndarray) -> dict:
-    """
-    计算详细的曝光统计信息（用于调试）
-    
     Args: 
         image: 输入图像 [H, W, 3], uint8, RGB
-    
+        sigma_list: 多个尺度的高斯核标准差
+                    [15, 80, 250] 对应 小/中/大 三个尺度
+
     Returns:
-        stats: 统计字典
+        R: 反射分量（物体固有颜色）[H, W, 3], float32, [0, 1]
+        L: 光照分量（亮度）[H, W, 3], float32, [0, 1]
     """
-    I_gray = 0.299 * image[:, :, 0] + 0.587 * image[:, :, 1] + 0.114 * image[:, : , 2]
-    
-    stats = {
-        'mean': np.mean(I_gray),
-        'std': np.std(I_gray),
-        'min': np.min(I_gray),
-        'max': np.max(I_gray),
-        'median': np. median(I_gray),
-        'percentile_10': np.percentile(I_gray, 10),
-        'percentile_90': np.percentile(I_gray, 90),
-        'E_vi': np.mean(I_gray) / 255.0
-    }
-    
-    return stats
+    # 转换到 float32 并归一化
+    img_float = image.astype(np.float32) / 255.0
+    img_float = np.maximum(img_float, 1e-6)
+
+    # 在对数域中累积
+    log_img = np.log(img_float)
+    log_L = np.zeros_like(log_img)
+
+    # 多尺度均值
+    for sigma in sigma_list:
+        # 对每个尺度计算高斯模糊并累加
+        blurred = cv2.GaussianBlur(img_float, (0, 0), sigma)
+        blurred = np.maximum(blurred, 1e-6)
+        log_L += np.log(blurred)
+
+    # 取平均
+    log_L /= len(sigma_list)
+
+    # 分离反射和光照
+    log_R = log_img - log_L
+    R = np.clip(np.exp(log_R), 0, 1)
+    L = np.clip(np.exp(log_L), 0, 1)
+
+    return R, L
+
+
+def enhance_illumination(L: np.ndarray, gamma: float = 0.4) -> np.ndarray:
+    """
+    增强光照分量
+
+    Args:
+        L: 光照分量 [H, W, 3], float32, [0, 1]
+        gamma:  Gamma 校正系数，越小提亮越强（0.4 用于极暗场景）
+
+    Returns:
+        L_enhanced: 增强后的光照 [H, W, 3], float32, [0, 1]
+    """
+    L_enhanced = np.power(L, gamma)
+    return L_enhanced
+
+
+def apply_clahe(image: np.ndarray, clip_limit: float = 0.03) -> np.ndarray:
+    """
+    应用自适应直方图均衡化（CLAHE）
+
+    Args:
+        image: 输入图像 [H, W, 3], float32, [0, 1]
+        clip_limit: 对比度限制，防止过度增强
+
+    Returns:
+        enhanced: 均衡化后的图像 [H, W, 3], float32, [0, 1]
+    """
+    # 转换到 uint8
+    img_uint8 = (image * 255).astype(np.uint8)
+
+    # 转换到 LAB 空间（只对 L 通道做均衡）
+    lab = cv2.cvtColor(img_uint8, cv2.COLOR_RGB2LAB)
+    l, a, b = cv2.split(lab)
+
+    # CLAHE
+    clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=(8, 8))
+    l_clahe = clahe.apply(l)
+
+    # 合并回去
+    lab_clahe = cv2.merge([l_clahe, a, b])
+    rgb_clahe = cv2.cvtColor(lab_clahe, cv2.COLOR_LAB2RGB)
+
+    return rgb_clahe.astype(np.float32) / 255.0
+
+
+def enhance_low_light(image: np.ndarray,
+                      exposure: float = None,
+                      sigma_list: list = [15, 80, 250]) -> np.ndarray:  # 修改参数
+    """
+    完整的低光增强流程（主函数）
+
+    Args: 
+        image: 输入图像 [H, W, 3], uint8, RGB
+        exposure: 曝光度（0-1），如果为 None 则自动计算
+        sigma_list: 多尺度 Retinex 的尺度列表
+
+    Returns:
+        enhanced:  增强后的图像 [H, W, 3], uint8, RGB
+    """
+    # 1. 计算曝光度（如果未提供）
+    if exposure is None:
+        from utils.exposure_metrics import compute_exposure
+        exposure = compute_exposure(image)
+
+    # 2. 根据曝光度选择 Gamma 值
+    if exposure < 0.2:
+        gamma = 0.4  # 极暗
+    elif exposure < 0.4:
+        gamma = 0.5  # 弱光
+    else:
+        gamma = 0.6  # 正常偏暗
+
+    print(f"  [增强] 曝光度={exposure:.3f}, Gamma={gamma}, 多尺度Retinex")
+
+    # 3. 多尺度 Retinex 分解（改进）
+    R, L = retinex_decompose(image, sigma_list=sigma_list)
+
+    # 4-7. 后续步骤保持不变
+    L_enhanced = enhance_illumination(L, gamma=gamma)
+    I_enhanced = R * L_enhanced
+    I_enhanced = np.clip(I_enhanced, 0, 1)
+    I_final = apply_clahe(I_enhanced, clip_limit=0.03)
+    result = (I_final * 255).astype(np.uint8)
+
+    return result
 
 
 # ========== 测试代码 ==========
 if __name__ == "__main__":
-    from PIL import Image
     import matplotlib.pyplot as plt
-    
-    # 测试图像列表（如果有的话）
-    test_images = [
-        "data/LLVIP/vi/010001.jpg",  # 替换为你的测试图像
-    ]
-    
-    for img_path in test_images: 
-        try:
-            img = Image.open(img_path).convert('RGB')
-            img_np = np.array(img)
-            
-            # 计算曝光度
-            E_vi = compute_exposure(img_np)
-            level = get_illumination_level(E_vi)
-            prompt = generate_dynamic_prompt(E_vi)
-            stats = compute_exposure_statistics(img_np)
-            
-            # 打印结果
-            print(f"\n{'='*60}")
-            print(f"图像: {img_path}")
-            print(f"曝光度 E_vi: {E_vi:.4f}")
-            print(f"光照等级: {level}")
-            print(f"动态提示词: {prompt}")
-            print(f"详细统计:")
-            for key, val in stats.items():
-                print(f"  {key}: {val:.2f}")
-            
-        except FileNotFoundError:
-            print(f"❌ 图像未找到: {img_path}")
-    
-    print("\n✅ 曝光度计算模块测试完成")
+    from PIL import Image
+
+    # 测试用例
+    test_image_path = "data/LLVIP/vi/010001.jpg"  # 替换为你的测试图像
+
+    try:
+        img = np.array(Image.open(test_image_path).convert('RGB'))
+        print(f"✅ 加载测试图像：{img.shape}")
+
+        # 执行增强
+        enhanced = enhance_low_light(img)
+
+        # 可视化对比
+        fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+        axes[0].imshow(img)
+        axes[0].set_title("Original (Low-Light)")
+        axes[0].axis('off')
+
+        axes[1].imshow(enhanced)
+        axes[1].set_title("Enhanced (Retinex)")
+        axes[1].axis('off')
+
+        plt.tight_layout()
+        plt.savefig("test_enhancement.png", dpi=150, bbox_inches='tight')
+        print("✅ 测试完成，结果保存到 test_enhancement.png")
+
+    except FileNotFoundError:
+        print("❌ 测试图像未找到，请修改 test_image_path")
