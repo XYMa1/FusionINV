@@ -9,11 +9,12 @@ class Range(NamedTuple):
 
 
 @dataclass
+@dataclass
 class RunConfig:
     # Visible image path
-    vis_image_path: Path
+    vis_image_path: Path = Path('./data/in_vis.png')
     # Infrared image path
-    ir_image_path: Path
+    ir_image_path: Path = Path('./data/in_ir. png')
     # Domain name (e.g., buildings, animals)
     domain_name: Optional[str] = None
     # Output path
@@ -48,6 +49,11 @@ class RunConfig:
 
     def __post_init__(self):
         save_name = f'vis={self.vis_image_path.stem}---ir={self.ir_image_path.stem}'
+
+        # 处理 domain_name 为 None 的情况
+        if self.domain_name is None:
+            self.domain_name = "general"
+
         self.output_path = self.output_path / self.domain_name / save_name
         self.output_path.mkdir(parents=True, exist_ok=True)
 
