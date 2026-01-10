@@ -1,3 +1,7 @@
+import warnings
+warnings.filterwarnings('ignore', category=FutureWarning)
+warnings.filterwarnings('ignore', category=UserWarning)
+
 import sys
 from typing import List
 
@@ -5,7 +9,22 @@ import numpy as np
 import pyrallis
 import torch
 from PIL import Image
-from diffusers.training_utils import set_seed
+#from diffusers. utils import set_seed
+
+def set_seed(seed):
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+    import random
+    random.seed(seed)
+
+sys.path.append(".")
+sys.path.append("..")
+
+from AllinVIS import AllinVISModel
+from config import RunConfig, Range
+from utils import latent_utils
+from utils.latent_utils import load_latents_or_invert_images
 
 sys.path.append(".")
 sys.path.append("..")
