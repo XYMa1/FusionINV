@@ -1,4 +1,6 @@
 import abc
+# 在文件顶部，现有的 import 语句后添加：
+from utils.exposure_metrics import compute_exposure, generate_dynamic_prompt
 
 import torch
 from torch import inference_mode
@@ -13,7 +15,28 @@ Inversion code taken from:
 LOW_RESOURCE = True
 
 
-def invert(x0, pipe, prompt_src="", num_diffusion_steps=100, cfg_scale_src=3.5, eta=1):
+def invert(x0, pipe, prompt_src="", num_diffusion_steps=100, cfg_scale_src=3.5, eta=1,
+           use_dynamic_prompt=True, exposure=None):
+    """
+    改进的 DDPM Inversion，支持动态提示词
+
+    新增参数: 
+        use_dynamic_prompt:  是否使用基于曝光度的动态提示词
+        exposure: 预计算的曝光度（如果为 None 则自动计算）
+    """
+    # ========== 新增：动态提示词生成 ==========
+    if use_dynamic_prompt and prompt_src == "":
+        # 计算曝光度（如果未提供）
+        if exposure is None:
+            # x0 是 tensor [1, 3, H, W], 范围 [-1, 1]
+            # 转换为 numpy [H, W, 3], 范围 [0, 255]
+            img_np = ((x0[0].permute(1, 2, 0).cpu().numpy() + 1) * 127.5).astype(np.uint8)
+            exposure = compute_exposure(img_np)
+
+        # 生成动态提示词
+        prompt_src = generate_dynamic_prompt(exposure)
+        print(f"  [反演] 曝光度={exposure:.3f}, 使用动态提示词")
+        print(f"  [反演] Prompt: \"{prompt_src}\"")
     #  inverts a real image according to Algorithm 1 in https://arxiv.org/pdf/2304.06140.pdf,
     #  based on the code in https://github.com/inbarhub/DDPM_inversion
     #  returns wt, zs, wts:
