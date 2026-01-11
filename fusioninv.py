@@ -10,6 +10,7 @@ import numpy as np
 import pyrallis
 import torch
 from PIL import Image
+from pathlib import Path
 
 
 def set_seed(seed):
@@ -38,28 +39,29 @@ def main(cfg: RunConfig):
 def main_with_defaults():
     """
     使用默认配置运行（方便PyCharm直接运行）
+    可以在这里修改默认参数
     """
-    from pathlib import Path
-
-    # 设置默认参数
+    # ========== 在这里修改默认图像路径 ==========
     cfg = RunConfig(
-        vis_image_path=Path("data/LLVIP/vi/1.jpg"),
-        ir_image_path=Path("data/LLVIP/ir/1.jpg"),
-        domain_name="LLVIP",
-        num_timesteps=100,
-        load_latents=False,  # 首次运行设为False，之后改为True加速
+        vis_image_path=Path("data/LLVIP/vi/1.jpg"),  # ← 修改可见光图像路径
+        ir_image_path=Path("data/LLVIP/ir/1.jpg"),  # ← 修改红外图像路径
+        domain_name="LLVIP",  # ← 修改数据集名称
+        num_timesteps=100,  # ← 修改去噪步数（100推荐）
+        load_latents=False,  # ← 首次False，之后True加速
         skip_steps=32,
         seed=42,
     )
+    # =========================================
 
+    print("\n" + "=" * 60)
+    print("🚀 LIT-Fusion - 使用默认配置运行")
     print("=" * 60)
-    print("使用默认配置运行 LIT-Fusion")
-    print("=" * 60)
-    print(f"  可见光图像: {cfg.vis_image_path}")
-    print(f"  红外图像:    {cfg.ir_image_path}")
-    print(f"  去噪步数:   {cfg.num_timesteps}")
-    print(f"  域名称:     {cfg.domain_name}")
-    print("=" * 60)
+    print(f"  可见光图像:   {cfg.vis_image_path}")
+    print(f"  红外图像:     {cfg.ir_image_path}")
+    print(f"  去噪步数:    {cfg.num_timesteps}")
+    print(f"  域名称:      {cfg.domain_name}")
+    print(f"  加载latents: {cfg.load_latents}")
+    print("=" * 60 + "\n")
 
     run(cfg)
 
@@ -99,7 +101,6 @@ def run_infraredvisiblefusion(model: AllinVISModel, cfg: RunConfig) -> List[Imag
     visir_prompts = [cfg.prompt] * 3  # 使用配置中的提示词
     visir_prompts[1] = ""  # VI 路径：空提示
     visir_prompts[2] = ""  # IR 路径：空提示
-    # visir_prompts[0] 保持原样，用于融合路径
     # ====================================
 
     images = model.pipe(
@@ -115,20 +116,18 @@ def run_infraredvisiblefusion(model: AllinVISModel, cfg: RunConfig) -> List[Imag
         cross_image_attention_range=Range(start=start_step, end=end_step),
     ).images
 
-    # Save images
-    # ========== 修改：使用输入文件名 ==========
-    base_name = cfg.ir_image_path.stem  # 使用IR图像的文件名（如 "1"）
+    # ========== 修改：使用输入文件名保存 ==========
+    base_name = cfg.ir_image_path.stem  # 提取文件名（如 "1"）
 
-    # Save images
-    images[0].save(cfg.output_path / f"{base_name}.png")  # 融合结果：1.png
-    images[1].save(cfg.output_path / f"out_vis_{base_name}.png")  # out_vis_1.png
-    images[2].save(cfg.output_path / f"out_ir_{base_name}.png")  # out_ir_1.png
+    images[0].save(cfg.output_path / f"{base_name}.png")
+    images[1].save(cfg.output_path / f"out_vis_{base_name}.png")
+    images[2].save(cfg.output_path / f"out_ir_{base_name}.png")
 
     print(f"\n✅ 融合完成，结果已保存:")
-    print(f"  融合:   {cfg.output_path}/{base_name}.png")
-    print(f"  可见光:  {cfg.output_path}/out_vis_{base_name}.png")
-    print(f"  红外:   {cfg.output_path}/out_ir_{base_name}.png")
-    # =========================================
+    print(f"  融合结果: {cfg.output_path}/{base_name}.png")
+    print(f"  可见光:    {cfg.output_path}/out_vis_{base_name}.png")
+    print(f"  红外:     {cfg.output_path}/out_ir_{base_name}.png")
+    # ============================================
 
     return images
 
