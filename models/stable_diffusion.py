@@ -1,118 +1,243 @@
-from typing import Tuple, List
+from typing import Any, Callable, Dict, List, Optional, Union
 
-import nltk
 import numpy as np
 import torch
-from sklearn.cluster import KMeans
+from diffusers import StableDiffusionPipeline
+from diffusers.models import AutoencoderKL
+from diffusers.pipelines.stable_diffusion import StableDiffusionPipelineOutput, StableDiffusionSafetyChecker
+from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion import rescale_noise_cfg
+from diffusers.schedulers import KarrasDiffusionSchedulers
+from tqdm import tqdm
+from transformers import CLIPTextModel, CLIPTokenizer, CLIPImageProcessor
 
-from constants import VIS_INDEX, IR_INDEX
+from config import Range
+from models.unet_2d_condition import FreeUUNet2DConditionModel
 
-nltk.download('punkt')
-nltk.download('averaged_perceptron_tagger')
 
-"""
-Self-segmentation technique taken from Prompt Mixing: https://github.com/orpatashnik/local-prompt-mixing
-"""
+class FusionINVAttentionStableDiffusionPipeline(StableDiffusionPipeline):
+    """ A modification of the standard StableDiffusionPipeline to incorporate our cross-image attention."""
 
-class Segmentor:
+    def __init__(self, vae: AutoencoderKL,
+                 text_encoder: CLIPTextModel,
+                 tokenizer: CLIPTokenizer,
+                 unet: FreeUUNet2DConditionModel,
+                 scheduler: KarrasDiffusionSchedulers,
+                 safety_checker: StableDiffusionSafetyChecker,
+                 feature_extractor: CLIPImageProcessor,
+                 requires_safety_checker: bool = True):
+        super().__init__(
+            vae, text_encoder, tokenizer, unet, scheduler, safety_checker, feature_extractor, requires_safety_checker
+        )
 
-    def __init__(self, prompt: str, object_nouns: List[str], num_segments: int = 5, res: int = 32):
-        self.prompt = prompt
-        self.num_segments = num_segments
-        self.resolution = res
-        self.object_nouns = object_nouns
-        tokenized_prompt = nltk.word_tokenize(prompt)
-        forbidden_words = [word.upper() for word in ["photo", "image", "picture"]]
-        self.nouns = [(i, word) for (i, (word, pos)) in enumerate(nltk.pos_tag(tokenized_prompt))
-                      if pos[:2] == 'NN' and word.upper() not in forbidden_words]
+    @torch.no_grad()
+    def __call__(
+            self,
+            prompt: Union[str, List[str]] = None,
+            height: Optional[int] = None,
+            width: Optional[int] = None,
+            num_inference_steps: int = 50,
+            guidance_scale: float = 7.5,
+            negative_prompt: Optional[Union[str, List[str]]] = None,
+            num_images_per_prompt: Optional[int] = 1,
+            eta: float = 0.0,
+            generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
+            latents: Optional[torch.FloatTensor] = None,
+            prompt_embeds: Optional[torch.FloatTensor] = None,
+            negative_prompt_embeds: Optional[torch.FloatTensor] = None,
+            output_type: Optional[str] = "pil",
+            return_dict: bool = True,
+            callback: Optional[Callable[[int, int, torch.FloatTensor], None]] = None,
+            callback_steps: int = 1,
+            cross_attention_kwargs: Optional[Dict[str, Any]] = None,
+            guidance_rescale: float = 0.0,
+            swap_guidance_scale: float = 1.0,
+            cross_image_attention_range: Range = Range(10, 90),
+            # DDPM addition
+            zs: Optional[List[torch.Tensor]] = None
+    ):
 
-    def update_attention(self, attn, is_cross):
-        res = int(attn.shape[2] ** 0.5)
-        if is_cross:
-            if res == 16:
-                self.cross_attention_32 = attn
-            elif res == 32:
-                self.cross_attention_64 = attn
-            elif res == 64:
-                self.cross_attention_128 = attn
+        # 0. Default height and width to unet
+        height = height or self.unet.config.sample_size * self.vae_scale_factor
+        width = width or self.unet.config.sample_size * self.vae_scale_factor
+
+        # 1. Check inputs. Raise error if not correct
+        self.check_inputs(
+            prompt, height, width, callback_steps, negative_prompt, prompt_embeds, negative_prompt_embeds
+        )
+
+        # 2. Define call parameters
+        if prompt is not None and isinstance(prompt, str):
+            batch_size = 1
+        elif prompt is not None and isinstance(prompt, list):
+            batch_size = len(prompt)
         else:
-            if res == 32:
-                self.self_attention_32 = attn
-            elif res == 64:
-                self.self_attention_64 = attn
-            elif res == 128:
-                self.self_attention_128 = attn
+            batch_size = prompt_embeds.shape[0]
 
-    def __call__(self, *args, **kwargs): #meanlessness
-        clusters = self.cluster()
-        cluster2noun = self.cluster2noun(clusters)
-        return cluster2noun
+        device = self._execution_device
+        # here `guidance_scale` is defined analog to the guidance weight `w` of equation (2)
+        # of the Imagen paper: https://arxiv.org/pdf/2205.11487.pdf . `guidance_scale = 1`
+        # corresponds to doing no classifier free guidance.
+        do_classifier_free_guidance = guidance_scale > 1.0
 
-    def cluster(self, res: int = 32):
-        np.random.seed(1)
-        self_attn = self.self_attention_32 if res == 32 else self.self_attention_64
+        # 3. Encode input prompt
+        text_encoder_lora_scale = (
+            cross_attention_kwargs.get("scale", None) if cross_attention_kwargs is not None else None
+        )
+        prompt_embeds = self._encode_prompt(
+            prompt,
+            device,
+            num_images_per_prompt,
+            do_classifier_free_guidance,
+            negative_prompt,
+            prompt_embeds=prompt_embeds,
+            negative_prompt_embeds=negative_prompt_embeds,
+            lora_scale=text_encoder_lora_scale,
+        )
 
-        vis_attn = self_attn[VIS_INDEX].mean(dim=0).cpu().numpy()
-        vis_kmeans = KMeans(n_clusters=self.num_segments, n_init=10).fit(vis_attn)
-        vis_clusters = vis_kmeans.labels_.reshape(res, res)
+        # 4. Prepare timesteps
+        self.scheduler.set_timesteps(num_inference_steps, device=device)
+        timesteps = self.scheduler.timesteps
+        t_to_idx = {int(v): k for k, v in enumerate(timesteps[-zs[0].shape[0]:])}
+        timesteps = timesteps[-zs[0].shape[0]:]
 
-        ir_attn = self_attn[IR_INDEX].mean(dim=0).cpu().numpy()
-        ir_kmeans = KMeans(n_clusters=self.num_segments, n_init=10).fit(ir_attn)
-        ir_clusters = ir_kmeans.labels_.reshape(res, res)
+        # 5. Prepare latent variables
+        num_channels_latents = self.unet.config.in_channels
+        latents = self.prepare_latents(
+            batch_size * num_images_per_prompt,
+            num_channels_latents,
+            height,
+            width,
+            prompt_embeds.dtype,
+            device,
+            generator,
+            latents,
+        )
 
-        return vis_clusters, ir_clusters
+        # 7. Denoising loop
+        num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
 
-    def cluster2noun(self, clusters, cross_attn, attn_index):
-        result = {}
-        res = int(cross_attn.shape[2] ** 0.5)
-        nouns_indices = [index for (index, word) in self.nouns]
-        cross_attn = cross_attn[attn_index].mean(dim=0).reshape(res, res, -1)
-        nouns_maps = cross_attn.cpu().numpy()[:, :, [i + 1 for i in nouns_indices]]
-        normalized_nouns_maps = np.zeros_like(nouns_maps).repeat(2, axis=0).repeat(2, axis=1)
-        for i in range(nouns_maps.shape[-1]):
-            curr_noun_map = nouns_maps[:, :, i].repeat(2, axis=0).repeat(2, axis=1)
-            normalized_nouns_maps[:, :, i] = (curr_noun_map - np.abs(curr_noun_map.min())) / curr_noun_map.max()
-        
-        max_score = 0
-        all_scores = []
-        for c in range(self.num_segments):
-            cluster_mask = np.zeros_like(clusters)
-            cluster_mask[clusters == c] = 1
-            score_maps = [cluster_mask * normalized_nouns_maps[:, :, i] for i in range(len(nouns_indices))]
-            scores = [score_map.sum() / cluster_mask.sum() for score_map in score_maps]
-            all_scores.append(max(scores))
-            max_score = max(max(scores), max_score)
+        op = tqdm(timesteps[-zs[0].shape[0]:])
+        n_timesteps = len(timesteps[-zs[0].shape[0]:])
 
-        all_scores.remove(max_score)
-        mean_score = sum(all_scores) / len(all_scores)
+        count = 0
+        for t in op:
+            i = t_to_idx[int(t)]
 
-        for c in range(self.num_segments):
-            cluster_mask = np.zeros_like(clusters)
-            cluster_mask[clusters == c] = 1
-            score_maps = [cluster_mask * normalized_nouns_maps[:, :, i] for i in range(len(nouns_indices))]
-            scores = [score_map.sum() / cluster_mask.sum() for score_map in score_maps]
-            result[c] = self.nouns[np.argmax(np.array(scores))] if max(scores) > 1.4 * mean_score else "BG"
+            # expand the latents if we are doing classifier free guidance
+            latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
+            latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
 
-        return result
+            noise_pred_swap = self.unet(
+                latent_model_input,
+                t,
+                encoder_hidden_states=prompt_embeds,
+                cross_attention_kwargs={'perform_swap': True},
+                return_dict=False,
+            )[0]
+            noise_pred_no_swap = self.unet(
+                latent_model_input,
+                t,
+                encoder_hidden_states=prompt_embeds,
+                cross_attention_kwargs={'perform_swap': False},
+                return_dict=False,
+            )[0]
+            # perform guidance
+            if do_classifier_free_guidance:
 
-    def create_mask(self, clusters, cross_attention, attn_index):
-        cluster2noun = self.cluster2noun(clusters, cross_attention, attn_index)
-        mask = clusters.copy()
-        obj_segments = [c for c in cluster2noun if cluster2noun[c][1] in self.object_nouns]
-        for c in range(self.num_segments):
-            mask[clusters == c] = 1 if c in obj_segments else 0
-        return torch.from_numpy(mask).to("cuda")
+                noise_swap_pred_uncond, noise_swap_pred_text = noise_pred_swap.chunk(2)
+                noise_no_swap_pred_uncond, noise_no_swap_pred_text = noise_pred_no_swap.chunk(2)
+                noise_pred = noise_swap_pred_uncond + guidance_scale * (
+                        noise_swap_pred_text - noise_no_swap_pred_uncond)
+            else:
 
-    def get_object_masks(self) -> Tuple[torch.Tensor]:
-        clusters_vis_32, clusters_ir_32 = self.cluster(res=32)
-        clusters_vis_64, clusters_ir_64 = self.cluster(res=64)
-        # clusters_vis_128, clusters_ir_128 = self.cluster(res=128)
+                # print("no guidance noise pred shape", noise_pred_swap.shape, noise_pred_no_swap.shape)
+                is_cross_image_step = cross_image_attention_range.start <= i <= cross_image_attention_range.end
+                if swap_guidance_scale > 1.0 and is_cross_image_step:
+                    swapping_strengths = np.linspace(swap_guidance_scale,
+                                                     max(swap_guidance_scale / 2, 1.0),
+                                                     n_timesteps)
+                    swapping_strength = swapping_strengths[count]
+                    noise_pred = noise_pred_no_swap + swapping_strength * (noise_pred_swap - noise_pred_no_swap)
+                    noise_pred = rescale_noise_cfg(noise_pred, noise_pred_swap, guidance_rescale=guidance_rescale)
+                else:
+                    noise_pred = noise_pred_swap
+                    print("noly this")
 
-        mask_ir_32 = self.create_mask(clusters_ir_32, self.cross_attention_32, IR_INDEX)
-        mask_vis_32 = self.create_mask(clusters_vis_32, self.cross_attention_32, VIS_INDEX)
-        mask_ir_64 = self.create_mask(clusters_ir_64, self.cross_attention_64, IR_INDEX)
-        mask_vis_64 = self.create_mask(clusters_vis_64, self.cross_attention_64, VIS_INDEX)
-        # mask_ir_128 = self.create_mask(clusters_ir_128, self.cross_attention_128, IR_INDEX)
-        # mask_vis_128 = self.create_mask(clusters_vis_128, self.cross_attention_128, VIS_INDEX)
+            latents = torch.stack([
+                self.perform_ddpm_step(t_to_idx, zs[latent_idx], latents[latent_idx], t, noise_pred[latent_idx], eta)
+                for latent_idx in range(latents.shape[0])
+            ])
 
-        return mask_ir_32, mask_vis_32, mask_ir_64, mask_vis_64 #, mask_ir_128, mask_vis_128
+            # call the callback, if provided
+            if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
+                # progress_bar.update()
+                if callback is not None and i % callback_steps == 0:
+                    callback(i, t, latents)
+
+            count += 1
+
+        if not output_type == "latent":
+            image = self.vae.decode(latents / self.vae.config.scaling_factor, return_dict=False)[0]
+            image, has_nsfw_concept = self.run_safety_checker(image, device, prompt_embeds.dtype)
+        else:
+            image = latents
+            has_nsfw_concept = None
+
+        if has_nsfw_concept is None:
+            do_denormalize = [True] * image.shape[0]
+        else:
+            do_denormalize = [not has_nsfw for has_nsfw in has_nsfw_concept]
+
+        image = self.image_processor.postprocess(image, output_type=output_type, do_denormalize=do_denormalize)
+
+        # Offload last model to CPU
+        if hasattr(self, "final_offload_hook") and self.final_offload_hook is not None:
+            self.final_offload_hook.offload()
+
+        if not return_dict:
+            return (image, has_nsfw_concept)
+
+        return StableDiffusionPipelineOutput(images=image, nsfw_content_detected=has_nsfw_concept)
+
+    def perform_ddpm_step(self, t_to_idx, zs, latents, t, noise_pred, eta):
+        idx = t_to_idx[int(t)]
+        z = zs[idx] if not zs is None else None
+        # 1. get previous step value (=t-1)
+        prev_timestep = t - self.scheduler.config.num_train_timesteps // self.scheduler.num_inference_steps
+        # 2. compute alphas, betas
+        alpha_prod_t = self.scheduler.alphas_cumprod[t]
+        alpha_prod_t_prev = self.scheduler.alphas_cumprod[
+            prev_timestep] if prev_timestep >= 0 else self.scheduler.final_alpha_cumprod
+        beta_prod_t = 1 - alpha_prod_t
+        # 3. compute predicted original sample from predicted noise also called
+        # "predicted x_0" of formula (12) from https://arxiv.org/pdf/2010.02502.pdf
+        pred_original_sample = (latents - beta_prod_t ** (0.5) * noise_pred) / alpha_prod_t ** (0.5)
+        # 5. compute variance: "sigma_t(η)" -> see formula (16)
+        # σ_t = sqrt((1 − α_t−1)/(1 − α_t)) * sqrt(1 − α_t/α_t−1)
+        # variance = self.scheduler._get_variance(timestep, prev_timestep)
+        variance = self.get_variance(t)
+        std_dev_t = eta * variance ** (0.5)
+        # Take care of asymetric reverse process (asyrp)
+        model_output_direction = noise_pred
+        # 6. compute "direction pointing to x_t" of formula (12) from https://arxiv.org/pdf/2010.02502.pdf
+        # pred_sample_direction = (1 - alpha_prod_t_prev - std_dev_t**2) ** (0.5) * model_output_direction
+        pred_sample_direction = (1 - alpha_prod_t_prev - eta * variance) ** (0.5) * model_output_direction
+        # 7. compute x_t without "random noise" of formula (12) from https://arxiv.org/pdf/2010.02502.pdf
+        prev_sample = alpha_prod_t_prev ** (0.5) * pred_original_sample + pred_sample_direction
+        # 8. Add noice if eta > 0
+        if eta > 0:
+            if z is None:
+                z = torch.randn(noise_pred.shape, device=self.device)
+            sigma_z = eta * variance ** (0.5) * z
+            prev_sample = prev_sample + sigma_z
+        return prev_sample
+
+    def get_variance(self, timestep):
+        prev_timestep = timestep - self.scheduler.config.num_train_timesteps // self.scheduler.num_inference_steps
+        alpha_prod_t = self.scheduler.alphas_cumprod[timestep]
+        alpha_prod_t_prev = self.scheduler.alphas_cumprod[
+            prev_timestep] if prev_timestep >= 0 else self.scheduler.final_alpha_cumprod
+        beta_prod_t = 1 - alpha_prod_t
+        beta_prod_t_prev = 1 - alpha_prod_t_prev
+        variance = (beta_prod_t_prev / beta_prod_t) * (1 - alpha_prod_t / alpha_prod_t_prev)
+        return variance
