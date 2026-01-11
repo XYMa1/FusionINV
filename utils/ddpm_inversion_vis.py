@@ -1,10 +1,11 @@
 import abc
-# 在文件顶部，现有的 import 语句后添加：
-from utils.exposure_metrics import compute_exposure, generate_dynamic_prompt
+import numpy as np
 
 import torch
 from torch import inference_mode
 from tqdm import tqdm
+# 在文件顶部，现有的 import 语句后添加：
+from utils.exposure_metrics import compute_exposure, generate_dynamic_prompt
 
 """
 Inversion code taken from: 
@@ -20,7 +21,7 @@ def invert(x0, pipe, prompt_src="", num_diffusion_steps=100, cfg_scale_src=3.5, 
     """
     改进的 DDPM Inversion，支持动态提示词
 
-    新增参数: 
+    新增参数:
         use_dynamic_prompt:  是否使用基于曝光度的动态提示词
         exposure: 预计算的曝光度（如果为 None 则自动计算）
     """
