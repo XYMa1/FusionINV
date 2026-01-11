@@ -125,6 +125,10 @@ def invert_images(sd_model, vis_image: Image.Image, ir_image: Image.Image, cfg: 
     # 保存曝光度信息（供后续使用）
     cfg.E_vi = E_vi
 
+    if isinstance(zs_ir, list):
+        zs_ir = torch.stack(zs_ir)
+    if isinstance(latents_ir, list):
+        latents_ir = torch.stack(latents_ir)
     return latents_vis, latents_ir, zs_vis, zs_ir
 
 
