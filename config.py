@@ -5,7 +5,7 @@ from typing import NamedTuple, Optional
 
 class Range(NamedTuple):
     start: int
-    end:  int
+    end: int
 
 
 @dataclass
@@ -35,7 +35,7 @@ class RunConfig:
     # Swap guidance scale
     swap_guidance_scale: float = 3.5
     # Attention contrasting strength
-    contrast_strength:  float = 1.67
+    contrast_strength: float = 1.67
     # Object nouns to use for self-segmentation (will use the domain name as default)
     object_noun: Optional[str] = None
     # Whether to load previously saved inverted latent codes
@@ -44,20 +44,23 @@ class RunConfig:
     skip_steps: int = 32
 
     direction_step_size: float = -0.12
-    
+
     # ========== 新增：LIT-Fusion 参数 ==========
     E_vi: float = 0.5  # 曝光度（会在 inversion 后自动更新）
+
     # =========================================
 
     def __post_init__(self):
-        save_name = f'vis={self.vis_image_path. stem}---ir={self.ir_image_path.stem}'
+        # ========== 修改：使用简洁的文件夹命名 ==========
+        # 提取红外图像的文件名作为文件夹名（如 "1", "2", "3"）
+        save_name = self.ir_image_path.stem  # "1.jpg" → "1"
 
-        # 处理 domain_name 为 None 的情况
         if self.domain_name is None:
             self.domain_name = "general"
 
         self.output_path = self.output_path / self.domain_name / save_name
-        self.output_path. mkdir(parents=True, exist_ok=True)
+        # ===============================================
+        self.output_path.mkdir(parents=True, exist_ok=True)
 
         # Handle the domain name, prompt, and object nouns used for masking, etc.
         # ✅ 修改：use_masked_adain 改为 False 时也允许运行
@@ -66,12 +69,12 @@ class RunConfig:
                 self.prompt = f"A photo of a {self.domain_name}"
             else:
                 self.prompt = ""
-        
+
         if self.object_noun is None and self.domain_name:
-            self.object_noun = self. domain_name
+            self.object_noun = self.domain_name
 
         # Define the paths to store the inverted latents to
         self.latents_path = Path(self.output_path) / "latents"
-        self. latents_path.mkdir(parents=True, exist_ok=True)
+        self.latents_path.mkdir(parents=True, exist_ok=True)
         self.vis_latent_save_path = self.latents_path / f"{self.vis_image_path.stem}_vis.pt"
         self.ir_latent_save_path = self.latents_path / f"{self.ir_image_path.stem}_ir.pt"
