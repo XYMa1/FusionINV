@@ -38,8 +38,8 @@ def load_size_src(image_path: pathlib.Path,
     bottom = min(bottom, h - top - 1)
     image = image[top:h - bottom, left:w - right]
 
-    image = np.array(Image.fromarray(image).resize((672,528)))
-    # image = np.array(Image.fromarray(image).resize((512, 512)))
+    #image = np.array(Image.fromarray(image).resize((672,528)))
+    image = np.array(Image.fromarray(image).resize((512, 512)))
     return image
 
 
