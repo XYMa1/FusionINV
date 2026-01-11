@@ -141,13 +141,41 @@ class FusionINVAttentionStableDiffusionPipeline(StableDiffusionPipeline):
                 cross_attention_kwargs={'perform_swap': False},
                 return_dict=False,
             )[0]
+
             # perform guidance
             if do_classifier_free_guidance:
 
+
                 noise_swap_pred_uncond, noise_swap_pred_text = noise_pred_swap.chunk(2)
                 noise_no_swap_pred_uncond, noise_no_swap_pred_text = noise_pred_no_swap.chunk(2)
-                noise_pred = noise_swap_pred_uncond + guidance_scale * (
-                        noise_swap_pred_text - noise_no_swap_pred_uncond)
+
+
+                # version 1
+                guidance_scale_first = 3.5
+                noise_pred_fusion_no_swap = noise_no_swap_pred_uncond[0:1] + 2.3 * (
+                        noise_no_swap_pred_text[0:1] - noise_no_swap_pred_uncond[0:1])
+                noise_pred_fusion_swap = noise_swap_pred_uncond[0:1] + 2.5 * (
+                        noise_swap_pred_text[0:1] - noise_swap_pred_uncond[0:1])
+                noise_pred_fusion_no_swap = rescale_noise_cfg(noise_pred_fusion_no_swap, noise_no_swap_pred_uncond[0:1])
+
+                if i % 1 == 0:
+                    if i < 40:
+                        noise_pred_fusion = noise_pred_fusion_swap + guidance_scale * 1.3 * (
+                            noise_pred_fusion_no_swap - noise_pred_fusion_swap)
+                    else:
+                        noise_pred_fusion = noise_pred_fusion_swap + guidance_scale * 1.0 * (
+                                noise_pred_fusion_no_swap - noise_pred_fusion_swap)
+                else:
+                    noise_pred_fusion = noise_pred_fusion_no_swap + guidance_scale * 2.5 * (
+                            noise_pred_fusion_swap - noise_pred_fusion_no_swap)
+
+
+                noise_pred_fusion = rescale_noise_cfg(noise_pred_fusion,
+                                                                 noise_pred_fusion_swap)
+                noise_pred_visir = noise_no_swap_pred_uncond[1:] + guidance_scale_first * (
+                        noise_no_swap_pred_text[1:] - noise_no_swap_pred_uncond[1:])
+                noise_pred = torch.cat([noise_pred_fusion, noise_pred_visir], dim=0)
+
             else:
 
                 # print("no guidance noise pred shape", noise_pred_swap.shape, noise_pred_no_swap.shape)
