@@ -1,167 +1,143 @@
-"""
-低光照图像增强模块
-实现基于 Retinex 理论的结构保留增强
-"""
+from pathlib import Path
+from typing import Tuple
 
 import numpy as np
-import cv2
-from typing import Tuple
-from skimage import exposure
+import torch
+from PIL import Image
+from diffusers.training_utils import set_seed
+
+from AllinVIS import AllinVISModel
+from config import RunConfig
+from utils import image_utils
+from utils.ddpm_inversion_vis import invert
+from utils.ddpm_inversion_inf2vis import invertinf
+# 在现有 import 后添加
+from utils.low_light_enhance import enhance_low_light
+from utils.exposure_metrics import compute_exposure
 
 
-def retinex_decompose(image: np.ndarray, sigma_list: list = [15, 80, 250]) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    多尺度 Retinex 分解（改进版）
-
-    Args: 
-        image: 输入图像 [H, W, 3], uint8, RGB
-        sigma_list: 多个尺度的高斯核标准差
-                    [15, 80, 250] 对应 小/中/大 三个尺度
-
-    Returns:
-        R: 反射分量（物体固有颜色）[H, W, 3], float32, [0, 1]
-        L: 光照分量（亮度）[H, W, 3], float32, [0, 1]
-    """
-    # 转换到 float32 并归一化
-    img_float = image.astype(np.float32) / 255.0
-    img_float = np.maximum(img_float, 1e-6)
-
-    # 在对数域中累积
-    log_img = np.log(img_float)
-    log_L = np.zeros_like(log_img)
-
-    # 多尺度均值
-    for sigma in sigma_list:
-        # 对每个尺度计算高斯模糊并累加
-        blurred = cv2.GaussianBlur(img_float, (0, 0), sigma)
-        blurred = np.maximum(blurred, 1e-6)
-        log_L += np.log(blurred)
-
-    # 取平均
-    log_L /= len(sigma_list)
-
-    # 分离反射和光照
-    log_R = log_img - log_L
-    R = np.clip(np.exp(log_R), 0, 1)
-    L = np.clip(np.exp(log_L), 0, 1)
-
-    return R, L
-
-
-def enhance_illumination(L: np.ndarray, gamma: float = 0.4) -> np.ndarray:
-    """
-    增强光照分量
-
-    Args:
-        L: 光照分量 [H, W, 3], float32, [0, 1]
-        gamma:  Gamma 校正系数，越小提亮越强（0.4 用于极暗场景）
-
-    Returns:
-        L_enhanced: 增强后的光照 [H, W, 3], float32, [0, 1]
-    """
-    L_enhanced = np.power(L, gamma)
-    return L_enhanced
-
-
-def apply_clahe(image: np.ndarray, clip_limit: float = 0.03) -> np.ndarray:
-    """
-    应用自适应直方图均衡化（CLAHE）
-
-    Args:
-        image: 输入图像 [H, W, 3], float32, [0, 1]
-        clip_limit: 对比度限制，防止过度增强
-
-    Returns:
-        enhanced: 均衡化后的图像 [H, W, 3], float32, [0, 1]
-    """
-    # 转换到 uint8
-    img_uint8 = (image * 255).astype(np.uint8)
-
-    # 转换到 LAB 空间（只对 L 通道做均衡）
-    lab = cv2.cvtColor(img_uint8, cv2.COLOR_RGB2LAB)
-    l, a, b = cv2.split(lab)
-
-    # CLAHE
-    clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=(8, 8))
-    l_clahe = clahe.apply(l)
-
-    # 合并回去
-    lab_clahe = cv2.merge([l_clahe, a, b])
-    rgb_clahe = cv2.cvtColor(lab_clahe, cv2.COLOR_LAB2RGB)
-
-    return rgb_clahe.astype(np.float32) / 255.0
-
-
-def enhance_low_light(image: np.ndarray,
-                      exposure: float = None,
-                      sigma_list: list = [15, 80, 250]) -> np.ndarray:  # 修改参数
-    """
-    完整的低光增强流程（主函数）
-
-    Args: 
-        image: 输入图像 [H, W, 3], uint8, RGB
-        exposure: 曝光度（0-1），如果为 None 则自动计算
-        sigma_list: 多尺度 Retinex 的尺度列表
-
-    Returns:
-        enhanced:  增强后的图像 [H, W, 3], uint8, RGB
-    """
-    # 1. 计算曝光度（如果未提供）
-    if exposure is None:
-        from utils.exposure_metrics import compute_exposure
-        exposure = compute_exposure(image)
-
-    # 2. 根据曝光度选择 Gamma 值
-    if exposure < 0.2:
-        gamma = 0.4  # 极暗
-    elif exposure < 0.4:
-        gamma = 0.5  # 弱光
+def load_latents_or_invert_images(model: AllinVISModel, cfg: RunConfig):
+    if cfg.load_latents and cfg.vis_latent_save_path.exists() and cfg.ir_latent_save_path.exists():
+        print("Loading existing latents...")
+        latents_vis, latents_ir = load_latents(cfg.vis_latent_save_path, cfg.ir_latent_save_path)
+        noise_vis, noise_ir = load_noise(cfg.vis_latent_save_path, cfg.ir_latent_save_path)
+        print("Done.")
     else:
-        gamma = 0.6  # 正常偏暗
-
-    print(f"  [增强] 曝光度={exposure:.3f}, Gamma={gamma}, 多尺度Retinex")
-
-    # 3. 多尺度 Retinex 分解（改进）
-    R, L = retinex_decompose(image, sigma_list=sigma_list)
-
-    # 4-7. 后续步骤保持不变
-    L_enhanced = enhance_illumination(L, gamma=gamma)
-    I_enhanced = R * L_enhanced
-    I_enhanced = np.clip(I_enhanced, 0, 1)
-    I_final = apply_clahe(I_enhanced, clip_limit=0.03)
-    result = (I_final * 255).astype(np.uint8)
-
-    return result
+        print("Inverting images...")
+        vis_image, ir_image = image_utils.load_images(cfg=cfg, save_path=cfg.output_path)
+        model.enable_edit = False  # Deactivate the cross-image attention layers
+        latents_vis, latents_ir, noise_vis, noise_ir = invert_images(vis_image=vis_image,
+                                                                             ir_image=ir_image,
+                                                                             sd_model=model.pipe,
+                                                                             cfg=cfg)
+        model.enable_edit = True
+        print("Done.")
+    return latents_vis, latents_ir, noise_vis, noise_ir
 
 
-# ========== 测试代码 ==========
-if __name__ == "__main__":
-    import matplotlib.pyplot as plt
-    from PIL import Image
+def load_latents(vis_latent_save_path: Path, ir_latent_save_path: Path) -> Tuple[torch.Tensor, torch.Tensor]:
+    latents_vis = torch.load(vis_latent_save_path)
+    latents_ir = torch.load(ir_latent_save_path)
+    if type(latents_ir) == list:
+        latents_vis = [l.to("cuda") for l in latents_vis]
+        latents_ir = [l.to("cuda") for l in latents_ir]
+    else:
+        latents_vis = latents_vis.to("cuda")
+        latents_ir = latents_ir.to("cuda")
+    return latents_vis, latents_ir
 
-    # 测试用例
-    test_image_path = "data/LLVIP/vi/010001.jpg"  # 替换为你的测试图像
 
-    try:
-        img = np.array(Image.open(test_image_path).convert('RGB'))
-        print(f"✅ 加载测试图像：{img.shape}")
+def load_noise(vis_latent_save_path: Path, ir_latent_save_path: Path) -> Tuple[torch.Tensor, torch.Tensor]:
+    latents_vis = torch.load(vis_latent_save_path.parent / (vis_latent_save_path.stem + "_ddpm_noise.pt"))
+    latents_ir = torch.load(ir_latent_save_path.parent / (ir_latent_save_path.stem + "_ddpm_noise.pt"))
+    latents_vis = latents_vis.to("cuda")
+    latents_ir = latents_ir.to("cuda")
+    return latents_vis, latents_ir
 
-        # 执行增强
-        enhanced = enhance_low_light(img)
 
-        # 可视化对比
-        fig, axes = plt.subplots(1, 2, figsize=(12, 5))
-        axes[0].imshow(img)
-        axes[0].set_title("Original (Low-Light)")
-        axes[0].axis('off')
+def invert_images(sd_model, vis_image: Image.Image, ir_image: Image.Image, cfg: RunConfig):
+    """
+    改进的图像反演流程：集成低光增强
+    """
+    # ========== 可见光路：增强 + 反演 ==========
+    print("\n[阶段 1] 可见光图像预处理")
 
-        axes[1].imshow(enhanced)
-        axes[1].set_title("Enhanced (Retinex)")
-        axes[1].axis('off')
+    # 1. 计算原始曝光度
+    vis_np = np.array(vis_image)
+    E_vi = compute_exposure(vis_np)
+    print(f"  原始曝光度: {E_vi:.4f}")
 
-        plt.tight_layout()
-        plt.savefig("test_enhancement.png", dpi=150, bbox_inches='tight')
-        print("✅ 测试完成，结果保存到 test_enhancement.png")
+    # 2. 低光增强（如果需要）
+    if E_vi < 0.6:  # 只对暗图增强
+        print(f"  检测到低光场景，执行 Retinex 增强...")
+        vis_enhanced_np = enhance_low_light(vis_np, exposure=E_vi)
+        vis_enhanced = Image.fromarray(vis_enhanced_np)
 
-    except FileNotFoundError:
-        print("❌ 测试图像未找到，请修改 test_image_path")
+        # 保存增强后的图像（用于调试）
+        if cfg.output_path:
+            vis_enhanced.save(cfg.output_path / "vi_enhanced.png")
+            print(f"  增强图像已保存:  vi_enhanced.png")
+    else:
+        print(f"  光照充足，跳过增强")
+        vis_enhanced_np = vis_np
+
+    # 3. 转换为 tensor
+    input_vis = torch.from_numpy(vis_enhanced_np).float() / 127.5 - 1.0
+    input_vis = input_vis.permute(2, 0, 1).unsqueeze(0).to('cuda')
+
+    # 4. DDPM Inversion（使用动态提示词）
+    print(f"  执行 DDPM Inversion（动态提示词）...")
+    set_seed(cfg.seed)
+    zs_vis, latents_vis, directions = invert(
+        x0=input_vis,
+        pipe=sd_model,
+        prompt_src="",  # 留空以触发动态提示词
+        num_diffusion_steps=cfg.num_timesteps,
+        cfg_scale_src=5.5,  # 提高引导强度
+        use_dynamic_prompt=True,
+        exposure=E_vi
+    )
+
+    # ========== 红外路：标准反演 ==========
+    print("\n[阶段 2] 红外图像反演")
+    input_ir = torch.from_numpy(np.array(ir_image)).float() / 127.5 - 1.0
+    input_ir = input_ir.permute(2, 0, 1).unsqueeze(0).to('cuda')
+
+    set_seed(cfg.seed)
+    direction_step_size = float(cfg.direction_step_size)
+    zs_ir, latents_ir = invertinf(
+        x0=input_ir,
+        vis_direction=directions,
+        direction_step_size=direction_step_size,
+        pipe=sd_model,
+        num_diffusion_steps=cfg.num_timesteps,
+        cfg_scale_src=3.5
+    )
+
+    # 保存 latents（可选）
+    if not cfg.load_latents:
+        torch.save(latents_vis, cfg.latents_path / f"{cfg.vis_image_path.stem}_vis.pt")
+        torch.save(latents_ir, cfg.latents_path / f"{cfg.ir_image_path.stem}_ir.pt")
+        torch.save(zs_vis, cfg.latents_path / f"{cfg.vis_image_path.stem}_vis_ddpm_noise.pt")
+        torch.save(zs_ir, cfg.latents_path / f"{cfg.ir_image_path.stem}_ir_ddpm_noise. pt")
+        print(f"\n✅ Latents 已保存到 {cfg.latents_path}")
+
+    # 保存曝光度信息（供后续使用）
+    cfg.E_vi = E_vi
+
+    if isinstance(zs_ir, list):
+        zs_ir = torch.stack(zs_ir)
+    if isinstance(latents_ir, list):
+        latents_ir = torch.stack(latents_ir)
+    return latents_vis, latents_ir, zs_vis, zs_ir
+
+
+def get_init_latents_and_noises(model: AllinVISModel, cfg: RunConfig) -> Tuple[torch.Tensor, torch.Tensor]:
+    # If we stored all the latents along the diffusion process, select the desired one based on the skip_steps
+    if model.latents_ir.dim() == 4 and model.latents_vis.dim() == 4 and model.latents_vis.shape[0] > 1:
+        model.latents_ir = model.latents_ir[cfg.skip_steps]
+        model.latents_vis = model.latents_vis[cfg.skip_steps]
+    init_latents = torch.stack([model.latents_vis, model.latents_vis, model.latents_ir])
+    zs_fusion = model.zs_vis.clone()
+    init_zs = [ zs_fusion[cfg.skip_steps:], model.zs_vis[cfg.skip_steps:], model.zs_ir[cfg.skip_steps:]]
+    return init_latents, init_zs
