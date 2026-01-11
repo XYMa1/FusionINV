@@ -136,3 +136,34 @@ def calc_mean_std(feat, eps=1e-5, mask=None):
         feat_mean = feat.view(C, -1).mean(dim=1).view(C, 1, 1)
 
     return feat_mean, feat_std
+
+
+def calc_mean_std_2d(feat, eps=1e-5, mask=None):
+    """
+    计算2D特征的均值和标准差
+
+    Args:
+        feat: [C, D] 特征张量
+        eps: 防止除零的小值
+        mask: 可选的掩码
+
+    Returns:
+        feat_mean, feat_std: 均值和标准差 [C, 1]
+    """
+    size = feat.size()
+    assert len(size) == 2, f"Expected 2D tensor, got {len(size)}D"
+
+    C, D = size
+
+    if mask is not None:
+        # 应用掩码
+        feat_var = feat.view(C, -1)[:, mask.view(-1) == 1].var(dim=1) + eps
+        feat_std = feat_var.sqrt().view(C, 1)
+        feat_mean = feat.view(C, -1)[:, mask.view(-1) == 1].mean(dim=1).view(C, 1)
+    else:
+        # 无掩码
+        feat_var = feat.view(C, -1).var(dim=1) + eps
+        feat_std = feat_var.sqrt().view(C, 1)
+        feat_mean = feat.view(C, -1).mean(dim=1).view(C, 1)
+
+    return feat_mean, feat_std
