@@ -2,7 +2,8 @@ from typing import Any, Callable, Dict, List, Optional, Union
 
 import numpy as np
 import torch
-from diffusers import StableDiffusionPipeline, StableDiffusionXLPipeline
+from torch import FloatTensor
+from diffusers import StableDiffusionPipeline
 from diffusers.models import AutoencoderKL
 from diffusers.pipelines.stable_diffusion import StableDiffusionPipelineOutput, StableDiffusionSafetyChecker
 from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion import rescale_noise_cfg
@@ -41,7 +42,7 @@ class FusionINVAttentionStableDiffusionPipeline(StableDiffusionPipeline):
             num_images_per_prompt: Optional[int] = 1,
             eta: float = 0.0,
             generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
-            latents: Optional[torch.FloatTensor] = None,
+            latents: Optional[FloatTensor] = None,
             prompt_embeds: Optional[torch.FloatTensor] = None,
             negative_prompt_embeds: Optional[torch.FloatTensor] = None,
             output_type: Optional[str] = "pil",
