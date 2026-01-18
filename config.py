@@ -33,7 +33,7 @@ class RunConfig:
     # Timesteps to apply AdaIn
     adain_range: Range = Range(start=90, end=90)  # 保持原样（几乎不用）
     # Swap guidance scale
-    swap_guidance_scale: float = 1.5
+    swap_guidance_scale: float = 1.1
     # Attention contrasting strength
     contrast_strength: float = 1.67
     # Object nouns to use for self-segmentation (will use the domain name as default)
@@ -41,7 +41,7 @@ class RunConfig:
     # Whether to load previously saved inverted latent codes
     load_latents: bool = True
     # Number of steps to skip in the denoising process (used value from original edit-friendly DDPM paper)
-    skip_steps: int = 15
+    skip_steps: int = 40
 
     direction_step_size: float = -0.12
 
