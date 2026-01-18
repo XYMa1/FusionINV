@@ -70,30 +70,34 @@ def get_illumination_level(E_vi: float) -> str:
         return "明亮 (Bright)"
 
 
-def generate_dynamic_prompt(E_vi: float) -> str:
+def generate_dynamic_prompt(E_vi:  float) -> tuple: 
     """
-    根据曝光度生成动态的 Inversion 提示词（精简版）
+    根据曝光度生成动态的 Inversion 提示词（改进版 - 支持Negative）
 
     Args:
-        E_vi:  曝光度 [0, 1]
+        E_vi: 曝光度 [0, 1]
 
     Returns:
-        prompt: 用于 DDPM Inversion 的提示词
+        (positive_prompt, negative_prompt): 正向和负向提示词
     """
-    if E_vi < 0.2:
+    if E_vi < 0.15: 
         # 极暗：强烈的光照重建
-        prompt = "extremely dark scene, bright daylight, clear visibility"
-    elif E_vi < 0.4:
-        # 弱光：中等光照增强
-        prompt = "low light scene, natural illumination, enhanced brightness"
-    elif E_vi < 0.6:
-        # 正常偏暗：轻微增强
-        prompt = "dimly lit scene, improved clarity"
+        positive = "extremely dark scene transformed to bright daylight, clear visibility, sharp details"
+        negative = "dark, night, noise, blur, underexposed, shadows, low contrast"
+    elif E_vi < 0.3:
+        # 很暗：中等光照增强
+        positive = "low light scene with natural illumination, enhanced brightness, improved clarity"
+        negative = "dark, noise, blur, underexposed, shadows"
+    elif E_vi < 0.5:
+        # 弱光：轻微增强
+        positive = "dimly lit scene, improved visibility, balanced lighting"
+        negative = "dark, noise, blur"
     else:
         # 正常：保持原样
-        prompt = ""
+        positive = ""
+        negative = ""
 
-    return prompt
+    return positive, negative
 
 
 def compute_exposure_statistics(image: np.ndarray) -> dict:
