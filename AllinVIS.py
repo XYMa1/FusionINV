@@ -171,37 +171,18 @@ class AllinVISModel:
 
         return w1, w2, w3
 
-    def get_adain_callback(self):
-
-        def callback(st: int, timestep: int, latents: torch.FloatTensor) -> Callable:
-            self.step = st
-            # Compute the masks using prompt mixing self-segmentation and use the masks for AdaIN operation
-            if self.config.use_masked_adain and self.step == self.config.adain_range.start:
-                masks = self.segmentor.get_object_masks()
-                self.set_masks(masks)
-            # Apply AdaIN operation using the computed masks
-            if self.config.adain_range.start <= self.step < self.config.adain_range.end:
-                if self.config.use_masked_adain:
-                    latents[0] = maskedadain(latents[0], latents[1], self.image_ir_mask_64, self.image_vis_mask_64)
-                else:
-                    latents[0] = adain(latents[0], latents[1])
-
-        return callback
-
     def register_attention_control(self):
+        """注册三流混合注意力处理器"""
 
         model_self = self
 
         class AttentionProcessor:
+            """三流混合注意力处理器���GAP版本）"""
 
             def __init__(self, place_in_unet: str):
                 self.place_in_unet = place_in_unet
-                if not hasattr(F, "scaled_dot_product_attention"):
-                    raise ImportError("AttnProcessor2_0 requires torch 2.0, to use it, please upgrade torch to 2.0.")
-
-                # ========== 新增：用于识别 Cross-Attention 层 ==========
-                self.is_cross_attn_layer = False  # 标记是否是 Cross-Attention 层
-                # ====================================================
+                self.cached_text_K = None
+                self.cached_text_V = None
 
             def __call__(self,
                          attn,
@@ -213,13 +194,8 @@ class AllinVISModel:
 
                 residual = hidden_states
 
-                # ========== 新增：判断是否是 Cross-Attention ==========
+                # 判断是否是 Cross-Attention
                 is_cross = encoder_hidden_states is not None
-
-                # 如果是 Cross-Attention，标记当前层
-                if is_cross and model_self.enable_edit:
-                    self.is_cross_attn_layer = True
-                # ==================================================
 
                 if attn.spatial_norm is not None:
                     hidden_states = attn.spatial_norm(hidden_states, temb)
@@ -243,85 +219,78 @@ class AllinVISModel:
 
                 query = attn.to_q(hidden_states)
 
-                # is_cross 已经在前面定义了
-                if not is_cross:
-                    encoder_hidden_states = hidden_states
-                elif attn.norm_cross:
-                    encoder_hidden_states = attn.norm_encoder_hidden_states(encoder_hidden_states)
+                # ========== Cross-Attention:  缓存文本特征 ==========
+                if is_cross:
+                    if attn.norm_cross:
+                        encoder_hidden_states = attn.norm_encoder_hidden_states(encoder_hidden_states)
 
-                key = attn.to_k(encoder_hidden_states)
-                value = attn.to_v(encoder_hidden_states)
+                    key = attn.to_k(encoder_hidden_states)  # [B, 77, C]
+                    value = attn.to_v(encoder_hidden_states)
+
+                    # 只在 Decoder（up block）中缓存，节省显存
+                    if "up" in self.place_in_unet and model_self.enable_edit:
+                        self.cached_text_K = key.detach()
+                        self.cached_text_V = value.detach()
+
+                # ========== Self-Attention: 三流融合 ==========
+                else:
+                    encoder_hidden_states = hidden_states
+                    key = attn.to_k(encoder_hidden_states)
+                    value = attn.to_v(encoder_hidden_states)
 
                 inner_dim = key.shape[-1]
                 head_dim = inner_dim // attn.heads
 
-                # ========== 新增：在 Cross-Attention 中缓存文本特征 ==========
-                if is_cross and model_self.enable_edit and "up" in self.place_in_unet:
-                    # 缓存文本的 K 和 V（只取第一个样本，即 fusion 的文本）
-                    model_self.cached_text_K = key[OUT_INDEX: OUT_INDEX + 1].detach()  # [1, seq_len, dim]
-                    model_self.cached_text_V = value[OUT_INDEX: OUT_INDEX + 1].detach()
-                # =============================================================
-
                 # ========== LIT-Fusion 三流融合机制 ==========
                 should_mix = False
-                config_contrast_strength = model_self.config.contrast_strength
 
-                # 判断是否应该执行融合（Self-Attention + Decoder）
+                # 判断是否应该执行融合（Self-Attention + Decoder + 启用编辑）
                 if perform_swap and not is_cross and "up" in self.place_in_unet and model_self.enable_edit:
+                    from utils import attention_utils
                     if attention_utils.should_mix_keys_and_values(model_self, hidden_states):
                         should_mix = True
 
                         # 【核心】计算自适应权重
-                        # ✅ 修正：将递增的 step 转换为递减的 timestep
                         current_timestep = model_self.total_steps - model_self.step
-                        w1, w2, w3 = model_self.compute_adaptive_weights(current_timestep)
+                        w1, w2, w3 = self.compute_adaptive_weights(
+                            current_timestep,
+                            model_self.total_steps,
+                            model_self.E_vi
+                        )
 
                         # 提取三个流的特征（在 reshape 之前）
+                        from constants import IR_INDEX, VIS_INDEX, OUT_INDEX
+
                         K_ir = key[IR_INDEX]  # [seq_len, dim]
                         V_ir = value[IR_INDEX]
                         K_vi = key[VIS_INDEX]
                         V_vi = value[VIS_INDEX]
 
-                        # 提取文本流特征（安全版本）
-                        if model_self.cached_text_K is not None:
+                        # 【GAP方案】提取文本流特征
+                        if self.cached_text_K is not None:
                             try:
-                                # 获取目标维度
-                                spatial_len = K_ir.shape[0]  # 序列长度
-                                target_dim = K_ir.shape[1]  # 特征维度
+                                # 1. 全局平均池化 [B, 77, C] -> [B, 1, C]
+                                text_k_pooled = torch.mean(self.cached_text_K, dim=1, keepdim=True)
+                                text_v_pooled = torch.mean(self.cached_text_V, dim=1, keepdim=True)
 
-                                # Step 1: 调整序列长度
-                                K_txt_temp = adaptive_pool_1d(
-                                    model_self.cached_text_K.to(key.dtype),
-                                    target_len=spatial_len
-                                )[0]  # [spatial_len, cached_dim]
+                                # 2. 扩展到空间维度 [B, 1, C] -> [B, H*W, C]
+                                spatial_len = K_ir.shape[0]
+                                K_txt_batch = text_k_pooled.repeat(1, spatial_len, 1)
+                                V_txt_batch = text_v_pooled.repeat(1, spatial_len, 1)
 
-                                V_txt_temp = adaptive_pool_1d(
-                                    model_self.cached_text_V.to(value.dtype),
-                                    target_len=spatial_len
-                                )[0]
-
-                                cached_dim = K_txt_temp.shape[1]
-
-                                # Step 2: 调整特征维度（使用新函数）
-                                if cached_dim != target_dim:
-                                    K_txt = adaptive_dimension_projection(K_txt_temp, target_dim)
-                                    V_txt = adaptive_dimension_projection(V_txt_temp, target_dim)
-                                else:
-                                    K_txt = K_txt_temp
-                                    V_txt = V_txt_temp
+                                # 3. 提取单样本（用于OUT_INDEX）
+                                K_txt = K_txt_batch[0]  # [H*W, C]
+                                V_txt = V_txt_batch[0]
 
                             except Exception as e:
-                                # 如果出现任何错误，使用零向量
                                 print(f"  [Warning] 文本特征处理失败: {e}")
                                 K_txt = torch.zeros_like(K_ir)
                                 V_txt = torch.zeros_like(V_ir)
-                                w3 = 0.0  # 文本权重降为0
+                                w3 = 0.0
                                 # 重新归一化
                                 total = w1 + w2
-                                w1 = w1 / total
-                                w2 = w2 / total
+                                w1, w2 = w1 / total, w2 / total
                         else:
-                            # 如果还没缓存文本特征，使用零向量
                             K_txt = torch.zeros_like(K_ir)
                             V_txt = torch.zeros_like(V_ir)
 
@@ -335,10 +304,8 @@ class AllinVISModel:
 
                         # 调试输出（每10步打印一次）
                         if model_self.step % 10 == 0:
-                            t_current = model_self.total_steps - model_self.step
                             print(f"  [Fusion] Step={model_self.step}/{model_self.total_steps}, "
-                                  f"t={t_current}, E_vi={model_self.E_vi:.3f}, "
-                                  f"dim={K_ir.shape}, "
+                                  f"t={current_timestep}, E_vi={model_self.E_vi:. 3f}, "
                                   f"w_ir={w1:.2f}, w_vi={w2:.2f}, w_txt={w3:.2f}")
                 # ============================================
 
@@ -346,21 +313,22 @@ class AllinVISModel:
                 key = key.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
                 value = value.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
 
-                # Compute the cross attention and apply our contrasting operation
+                # 计算 Attention
+                from utils import attention_utils
                 hidden_states, attn_weight = attention_utils.compute_scaled_dot_product_attention(
                     query, key, value,
                     edit_map=perform_swap and model_self.enable_edit and should_mix,
                     is_cross=is_cross,
-                    contrast_strength=config_contrast_strength,
+                    contrast_strength=model_self.config.contrast_strength,
                     mask=attention_mask
                 )
 
-                # Update attention map for segmentation
+                # 更新 segmentation 的 attention map
                 if model_self.config.use_masked_adain and model_self.step == model_self.config.adain_range.start - 1:
                     model_self.segmentor.update_attention(attn_weight, is_cross)
 
                 hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, -1, attn.heads * head_dim)
-                hidden_states = hidden_states.to(query[OUT_INDEX].dtype)
+                hidden_states = hidden_states.to(query.dtype)
 
                 # linear proj
                 hidden_states = attn.to_out[0](hidden_states)
@@ -377,9 +345,49 @@ class AllinVISModel:
 
                 return hidden_states
 
+            @staticmethod
+            def compute_adaptive_weights(t, T, E_vi):
+                """
+                计算自适应三流权重（线性版本 - MVP）
+
+                Args:
+                    t:  当前时间步（从 T 递减到 0）
+                    T: 总时间步数
+                    E_vi: 曝光度 [0, 1]
+
+                Returns:
+                    (w1, w2, w3): IR权重, VI权重, Text权重
+                """
+                t_norm = t / T  # 归一化到 [1. 0 → 0.0]
+
+                # 根据时间阶段设置基础权重
+                if t_norm > 0.6:  # Early:  T → 0.6T (强结构)
+                    w1_base = 0.8
+                    w2_base = 0.1
+                    w3_base = 0.1
+                elif t_norm > 0.2:  # Mid: 0.6T → 0.2T (平衡过渡)
+                    alpha = (t_norm - 0.2) / 0.4  # 映射到 [1, 0]
+                    w1_base = 0.8 * alpha + 0.3 * (1 - alpha)
+                    w2_base = 0.1 * alpha + 0.6 * (1 - alpha)
+                    w3_base = 0.1
+                else:  # Late: 0.2T → 0 (强语义)
+                    w1_base = 0.3
+                    w2_base = 0.6
+                    w3_base = 0.1
+
+                # 基于曝光度调制
+                w2 = w2_base * E_vi  # VI权重：低光时降低
+                w3 = w3_base * (1 + 2 * (1 - E_vi))  # Text权重：低光时增强
+                w1 = 1.0 - w2 - w3  # IR权重：保证归一化
+
+                # 防御性归一化
+                total = w1 + w2 + w3
+                w1, w2, w3 = w1 / total, w2 / total, w3 / total
+
+                return w1, w2, w3
+
+        # ========== 注册处理器到 U-Net ==========
         def register_recr(net_, count, place_in_unet):
-            if net_.__class__.__name__ == 'ResnetBlock2D':
-                pass
             if net_.__class__.__name__ == 'Attention':
                 net_.set_processor(AttentionProcessor(place_in_unet + f"_{count + 1}"))
                 return count + 1
