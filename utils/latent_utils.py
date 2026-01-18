@@ -68,15 +68,20 @@ def invert_images(sd_model, vis_image: Image.Image, ir_image: Image.Image, cfg: 
     print(f"  原始曝光度: {E_vi:.4f}")
 
     # 2. 低光增强（如果需要）
-    if E_vi < 0.6:  # 只对暗图增强
-        print(f"  检测到低光场景，执行 Retinex 增强...")
+    if E_vi < 0.15:
+        # ========== 关键修改：极暗场景完全跳过增强 ==========
+        print(f"  ⚠️ 场景极暗(E_vi={E_vi:.3f})，跳过增强以保留细节")
+        vis_enhanced_np = vis_np
+        # =================================================
+    elif E_vi < 0.6:
+        print(f"  检测到低光场景，执行轻微增强...")
         vis_enhanced_np = enhance_low_light(vis_np, exposure=E_vi)
         vis_enhanced = Image.fromarray(vis_enhanced_np)
 
         # 保存增强后的图像（用于调试）
         if cfg.output_path:
             vis_enhanced.save(cfg.output_path / "vi_enhanced.png")
-            print(f"  增强图像已保存:  vi_enhanced.png")
+            print(f"  增强图像已保存:   vi_enhanced.png")
     else:
         print(f"  光照充足，跳过增强")
         vis_enhanced_np = vis_np
@@ -93,8 +98,8 @@ def invert_images(sd_model, vis_image: Image.Image, ir_image: Image.Image, cfg: 
         pipe=sd_model,
         prompt_src="",  # 留空以触发动态提示词
         num_diffusion_steps=cfg.num_timesteps,
-        cfg_scale_src=5.5,  # 提高引导强度
-        use_dynamic_prompt=True,
+        cfg_scale_src=1.0,  # 提高引导强度
+        use_dynamic_prompt=False,
         exposure=E_vi
     )
 
