@@ -5,7 +5,10 @@ import torch
 from torch import FloatTensor
 from diffusers import StableDiffusionPipeline
 from diffusers.models import AutoencoderKL
-from diffusers.pipelines.stable_diffusion import StableDiffusionPipelineOutput, StableDiffusionSafetyChecker
+from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion import (
+    StableDiffusionPipelineOutput,
+    StableDiffusionSafetyChecker
+)
 from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion import rescale_noise_cfg
 from diffusers.schedulers import KarrasDiffusionSchedulers
 from tqdm import tqdm
@@ -84,6 +87,15 @@ class FusionINVAttentionStableDiffusionPipeline(StableDiffusionPipeline):
         text_encoder_lora_scale = (
             cross_attention_kwargs.get("scale", None) if cross_attention_kwargs is not None else None
         )
+
+        # ========== 修复：强制 do_classifier_free_guidance=False 时的处理 ==========
+        if not do_classifier_free_guidance:
+            # 当 guidance_scale <= 1.0 时，不使用 CFG
+            # 此时必须确保 negative_prompt 为 None
+            print(f"  [调试] guidance_scale={guidance_scale} <= 1.0，禁用CFG")
+            negative_prompt = None
+            negative_prompt_embeds = None
+
         prompt_embeds = self._encode_prompt(
             prompt,
             device,
@@ -94,6 +106,7 @@ class FusionINVAttentionStableDiffusionPipeline(StableDiffusionPipeline):
             negative_prompt_embeds=negative_prompt_embeds,
             lora_scale=text_encoder_lora_scale,
         )
+        # ==================================================================
 
         # 4. Prepare timesteps
         self.scheduler.set_timesteps(num_inference_steps, device=device)
