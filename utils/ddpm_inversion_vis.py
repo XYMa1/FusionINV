@@ -17,38 +17,48 @@ LOW_RESOURCE = True
 
 
 def invert(x0, pipe, prompt_src="", num_diffusion_steps=100, cfg_scale_src=3.5, eta=1,
-           use_dynamic_prompt=True, exposure=None):
+           use_dynamic_prompt=False, exposure=None):
     """
-    改进的 DDPM Inversion，支持动态提示词
-
-    新增参数:
-        use_dynamic_prompt:  是否使用基于曝光度的动态提示词
-        exposure: 预计算的曝光度（如果为 None 则自动计算）
+    反演函数
     """
-    # ========== 新增：动态提示词生成 ==========
-    if use_dynamic_prompt and prompt_src == "":
-        # 计算曝光度（如果未提供）
-        if exposure is None:
-            # x0 是 tensor [1, 3, H, W], 范围 [-1, 1]
-            # 转换为 numpy [H, W, 3], 范围 [0, 255]
-            img_np = ((x0[0].permute(1, 2, 0).cpu().numpy() + 1) * 127.5).astype(np.uint8)
-            exposure = compute_exposure(img_np)
+    # 处理动态提示词
+    if use_dynamic_prompt and exposure is not None:
+        try:
+            from utils.exposure_metrics import generate_dynamic_prompt
+            prompt_src = generate_dynamic_prompt(exposure)
+            print(f"  [反演] 曝光度={exposure:. 3f}, 使用动态提示词")
+            print(f"  [反演] Prompt: \"{prompt_src}\"")
+        except:
+            print(f"  [反演] 使用空提示词（prompt_src='{prompt_src}'）")
+    else:
+        print(f"  [反演] 使用空提示词（prompt_src='{prompt_src}'）")
 
-        # 生成动态提示词
-        prompt_src = generate_dynamic_prompt(exposure)
-        print(f"  [反演] 曝光度={exposure:.3f}, 使用动态提示词")
-        print(f"  [反演] Prompt: \"{prompt_src}\"")
-    #  inverts a real image according to Algorithm 1 in https://arxiv.org/pdf/2304.06140.pdf,
-    #  based on the code in https://github.com/inbarhub/DDPM_inversion
-    #  returns wt, zs, wts:
-    #  wt - inverted latent
-    #  wts - intermediate inverted latents
-    #  zs - noise maps
+    # 设置时间步
     pipe.scheduler.set_timesteps(num_diffusion_steps)
+
+    # 编码图像到 latent
     with inference_mode():
         w0 = (pipe.vae.encode(x0).latent_dist.mode() * 0.18215).float()
-    wt, zs, wts, directions = inversion_forward_process(pipe, w0, etas=eta, prompt=prompt_src, cfg_scale=cfg_scale_src,
-                                            prog_bar=True, num_inference_steps=num_diffusion_steps)
+
+    # ========== 修改：兼容不同返回值 ==========
+    result = inversion_forward_process(
+        pipe, w0, etas=eta,
+        prompt=prompt_src,
+        cfg_scale=cfg_scale_src,
+        prog_bar=True,
+        num_inference_steps=num_diffusion_steps
+    )
+
+    # 处理返回值
+    if len(result) == 3:
+        wt, zs, wts = result
+        directions = []  # 没有方向信息
+    elif len(result) == 4:
+        wt, zs, wts, directions = result
+    else:
+        raise ValueError(f"inversion_forward_process returned {len(result)} values, expected 3 or 4")
+    # =========================================
+
     return zs, wts, directions
 
 
