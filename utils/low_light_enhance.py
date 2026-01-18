@@ -6,8 +6,6 @@
 import numpy as np
 import cv2
 from typing import Tuple
-from skimage import exposure
-
 
 def retinex_decompose(image: np.ndarray, sigma_list: list = [15, 80, 250]) -> Tuple[np.ndarray, np.ndarray]:
     """
@@ -111,15 +109,26 @@ def enhance_low_light(image: np.ndarray,
         from utils.exposure_metrics import compute_exposure
         exposure = compute_exposure(image)
 
-    # 2. 根据曝光度选择 Gamma 值
-    if exposure < 0.2:
-        gamma = 0.4  # 极暗
-    elif exposure < 0.4:
-        gamma = 0.5  # 弱光
+    # 2. 根据曝光度选择 Gamma 值（修改为更保守）
+    if exposure < 0.15:
+        gamma = 0.7  # 极暗（原0.4 → 0.7，减弱增强）
+        apply_enhancement = True
+    elif exposure < 0.3:
+        gamma = 0.8  # 弱光（原0.5 → 0.8）
+        apply_enhancement = True
+    elif exposure < 0.5:
+        gamma = 0.9  # 正常偏暗（原0.6 → 0.9）
+        apply_enhancement = True
     else:
-        gamma = 0.6  # 正常偏暗
+        gamma = 1.0  # 正常（不增强）
+        apply_enhancement = False
 
-    print(f"  [增强] 曝光度={exposure:.3f}, Gamma={gamma}, 多尺度Retinex")
+    print(f"  [增强] 曝光度={exposure:.3f}, Gamma={gamma}, apply={apply_enhancement}")
+
+    # 如果场景太暗（E_vi < 0.1），直接跳过增强
+    if exposure < 0.1:
+        print(f"  [警告] 场景过暗，跳过增强以保留细节")
+        return image
 
     # 3. 多尺度 Retinex 分解（改进）
     R, L = retinex_decompose(image, sigma_list=sigma_list)
